@@ -1,7 +1,8 @@
 # Features and Semantics:
 - Statically-typed with type inference: something between Odin and Rust;
 - compile-time hashmap;
-- possible states: const is ::, var is ':=', imm (runtime immutable) is probably #imm :=;
+- const is ::, var is ':=';
+- later, consider immutable vars;
 - structs, enums, descriminated unions, and proper pattern matching; 
 - no class-based inheritance; 
 - C-like types (vanilla unions, cstrings, ...); 
@@ -15,6 +16,8 @@
 - errors as values, panic when needed;
 - support for runtime reflection.
 
-# Implementation Details: How You Want Things Done
+# Implementation Details: How You Want Things Done:
+- compile to x64 (primarily); 
+- afterwards, implement portable register-based VM.
 
 # Syntax and Grammar (Specifics)
