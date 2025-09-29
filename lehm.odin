@@ -5,6 +5,8 @@ import "core:fmt"
 import "core:os"
 
 simple_token_t :: enum {
+    NONE = 0,
+
     BUILTIN,
 
     LEFT_PAREN,
@@ -16,14 +18,11 @@ simple_token_t :: enum {
 
     EQ, // =
     EQ_EQ, // ==
-    COLON,      // =
-    COLON_EQ,   // :=
-    COLON_COLON, // ::
+    COLON,      // :
     
     DOT, // .
     COMMA,      // ,
     SEMI_COLON, // ;
-    QUESTION, // ?
     HASH,         // "#"
     
     STAR,       // *
@@ -39,9 +38,10 @@ simple_token_t :: enum {
 
     AMP, // &
     AMP_AMP,   // &&
-    CARET,     // ^
     PIPE,      // |
     PIPE_PIPE, // ||
+    CARET,     // ^
+    TILDE,     // ~
 
     LESS,      // <
     LESS_LESS,  // << 
@@ -51,11 +51,12 @@ simple_token_t :: enum {
     GREAT_EQ,  // >=
 
     BANG,      // !
-    TILDE,     // ~
     BANG_EQ,   // !=
 }
 
 builtin_t :: enum {
+    NONE = 0, 
+
     IF,
     WHILE,
     FOR, 
@@ -98,6 +99,7 @@ main :: proc(){
     n, _ := os.read_full(handle, bytes[:]);
 
     tokens := tokenize(bytes[:])
+    fmt.println(can_double('{'))
     fmt.println(tokens)
 }
 
@@ -105,31 +107,47 @@ main :: proc(){
 map_char :: proc (c: u8) -> simple_token_t {
     using simple_token_t;
     switch c {
-        case '~' : return TILDE;
-        case '=' : return EQ;
-        case '|' : return PIPE;
-        case '%' : return PERCENT;
-        case '+' : return PLUS;
-        case '/' : return DIV_FSLASH;
-        case '\\' :return  BACK_SLASH;
-        case '*' :return STAR;
-        case '-' :return MINUS;
-        case '{' :return LEFT_CURLY;
-        case '}' :return RIGHT_CURLY;
-        case '[' :return LEFT_BRACKET;
-        case ']' :return RIGHT_BRACKET;
-        case '(' :return LEFT_PAREN;
-        case ')' :return RIGHT_PAREN;
-        case '!' :return BANG;
-        case '<' :return LESS;
-        case '>' :return GREAT;
-        case ':' :return COLON;
-        case ';' :return SEMI_COLON;
-        case ',' :return COMMA;
-        case '^' :return CARET;
+        case '~' : return TILDE
+        case '=' : return EQ
+        case '|' : return PIPE
+        case '%' : return PERCENT
+        case '+' : return PLUS
+        case '/' : return DIV_FSLASH
+        case '\\' :return  BACK_SLASH
+        case '*' :return STAR
+        case '-' :return MINUS
+        case '{' :return LEFT_CURLY
+        case '}' :return RIGHT_CURLY
+        case '[' :return LEFT_BRACKET
+        case ']' :return RIGHT_BRACKET
+        case '(' :return LEFT_PAREN
+        case ')' :return RIGHT_PAREN
+        case '!' :return BANG
+        case '<' :return LESS
+        case '>' :return GREAT
+        case ':' :return COLON
+        case ';' :return SEMI_COLON
+        case ',' :return COMMA
+        case '^' :return CARET
+        case '.': return DOT
+        case '#': return HASH
         
         case:
             panic("cannot parse char as token")
+    };
+}
+
+can_double :: proc(c: u8) -> simple_token_t{
+    using simple_token_t;
+
+    switch c {
+        case '=': return EQ_EQ;
+        case '|': return PIPE_PIPE;
+        case '+': return PLUS_PLUS;
+        case '-': return MINUS_MINUS;
+        case '<': return LESS_LESS;
+        case '>': return GREAT_GREAT;
+        case: return nil
     };
 }
 
@@ -150,6 +168,15 @@ match_consume_identifier_CHARorDIGIT :: proc(lexer: ^lexer_t) -> bool{
         case:
             return false
     }
+}
+
+match_consume :: proc(lexer : ^lexer_t, c: u8) -> bool {
+    pos := lexer.position 
+    if lexer.bytes[pos] == c{
+        lexer.position+=1; 
+        return true;
+    }
+    return false;
 }
 
 tokenize :: proc(buf: []u8) -> [dynamic]token_t {
@@ -179,6 +206,51 @@ tokenize :: proc(buf: []u8) -> [dynamic]token_t {
         lexer.begin_i = lexer.position-1;
 
         switch c {
+
+            case '#', '.', '~', '|','%','+','/','\\','*','-','{','}','[',']','(',')',':',';',',','^': {
+                t := can_double(c)
+                if t != nil && match_consume(&lexer, c){
+                    append(&tokens, t)
+                }else{
+                    append(&tokens, map_char(c))
+                }
+            }
+            case '=': {
+                if match_consume(&lexer, '='){
+                    append(&tokens, EQ_EQ)
+                }else if match_consume(&lexer, '>'){
+                    append(&tokens, EQ_ARROW)
+                }else{
+                    append(&tokens, EQ)
+                }
+            }
+            case '<': {  
+                if match_consume(&lexer, '='){
+                    append(&tokens, LESS_EQ)
+                }else if match_consume(&lexer, '<'){
+                    append(&tokens, LESS_LESS)
+                }else{
+                    append(&tokens, LESS)
+                }
+            }
+            case '>':{
+                if match_consume(&lexer, '='){
+                    append(&tokens, GREAT_EQ)
+                }else if match_consume(&lexer, '<'){
+                    append(&tokens, GREAT_GREAT)
+                }else{
+                    append(&tokens, GREAT)
+                }
+            }
+
+            case '!':{
+                if match_consume(&lexer, '='){
+                    append(&tokens, BANG_EQ)
+                }else{
+                    append(&tokens, BANG)
+                }
+            }
+
             case 'a'..='z',  'A'..='Z': {
                 for match_consume_identifier_CHARorDIGIT(&lexer){} 
 
@@ -189,6 +261,12 @@ tokenize :: proc(buf: []u8) -> [dynamic]token_t {
                 append(&tokens, ident);
             }
             
+            case '0': {}
+
+            case '1'..='9': {}
+
+            case '"': {}
+
             case ' ' , '\n' , '\r' , '\t' : {}
         }
     }
