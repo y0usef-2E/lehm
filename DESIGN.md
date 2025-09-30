@@ -1,5 +1,6 @@
 # Features and Semantics:
 - Statically-typed with type inference: something between Odin and Rust;
+- try to handle SIGNED/UNSIGNED differently;
 - compile-time hashmap;
 - const is ::, var is ':=';
 - later, consider immutable vars;

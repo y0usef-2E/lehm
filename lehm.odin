@@ -91,6 +91,12 @@ lexer_t :: struct{
 }
 
 main :: proc(){
+    test := "0b1111_1111"
+    assert(parse_binary_literal(transmute([]u8)test) == 255)
+    test2 := "0b111"
+    assert(parse_binary_literal(transmute([]u8)test2) == 7)
+
+
     handle, err := os.open("./tests/one.lh")
     if err != nil{
         panic("cannot find file"); 
@@ -99,7 +105,6 @@ main :: proc(){
     n, _ := os.read_full(handle, bytes[:]);
 
     tokens := tokenize(bytes[:])
-    fmt.println(can_double('{'))
     fmt.println(tokens)
 }
 
@@ -177,6 +182,103 @@ match_consume :: proc(lexer : ^lexer_t, c: u8) -> bool {
         return true;
     }
     return false;
+}
+
+match_consume_either :: proc(lexer: ^lexer_t, c1: u8, c2: u8) -> bool {
+    pos := lexer.position 
+    switch lexer.bytes[pos]{
+        case c1, c2: {
+            lexer.position+=1; 
+            return true
+        }
+        case: return false
+    }
+}
+
+match_consume_digit :: proc(lexer: ^lexer_t) -> bool {
+    pos := lexer.position 
+    switch lexer.bytes[pos]{
+        case '0'..='9': {
+            lexer.position+=1; 
+            return true
+        } 
+        case: return false
+    }
+}
+
+match_consume_hex_dig :: proc(lexer: ^lexer_t) -> bool{
+    pos := lexer.position 
+    switch lexer.bytes[pos]{
+        case '0'..='9', 'a'..='f', 'A'..='F': {
+            lexer.position+=1; 
+            return true
+        } 
+        case: return false
+    }
+}
+
+parse_binary_literal :: proc(str: []u8) -> uint{
+    res: uint = 0;
+    exp: uint = 0; 
+    i: int = len(str) -1
+    
+    // skip "0b":
+    for i>=2 {
+        c:= str[i] 
+        switch c {
+            case '0', '1':
+                res |= uint(c - '0') << exp 
+                exp+=1;
+            case '_':
+
+        }
+        i-=1;
+    } 
+    return res; 
+}
+
+parse_hex_literal :: proc(str : []u8) -> uint {
+    res: uint = 0;
+    exp: uint = 0; 
+    i: int = len(str) -1
+
+     // skip "0x":
+    for i>=2 {
+        c := str[i] 
+        switch c {
+           case '0'..='9':
+                res |= uint(c - '0') << (exp*4)
+                exp+=1
+           case 'a'..='f':
+                res |= (uint(c-'a') + 10) << (exp*4)
+                exp+=1
+           case 'A'..='F':
+                res |= (uint(c-'A') + 10 )<< (exp*4)
+                exp+=1
+            case '_':
+        }
+        i-=1;
+    } 
+    return res; 
+}
+
+parse_decimal_literal :: proc(str: []u8)->uint{
+    res: uint = 0;
+    factor: uint = 1; 
+    i: int = len(str) -1
+
+    for i>=0 {
+        c := str[i] 
+        switch c {
+           case '0'..='9':
+                res += uint(c - '0') * factor;
+                factor*=10
+
+           case '_':
+        }
+        i-=1;
+    } 
+    return res; 
 }
 
 tokenize :: proc(buf: []u8) -> [dynamic]token_t {
@@ -261,9 +363,47 @@ tokenize :: proc(buf: []u8) -> [dynamic]token_t {
                 append(&tokens, ident);
             }
             
-            case '0': {}
+            case '0': {
+                if match_consume(&lexer, 'b'){
+                    for match_consume_either(&lexer, '1', '0') || match_consume(&lexer, '_'){}
+                    
+                    start_i := lexer.begin_i;
+                    end_i_excl := lexer.position;
+                    
+                    value := int_literal_t(parse_binary_literal(lexer.bytes[start_i:end_i_excl]))
+                    append(&tokens, value);
+                } else if match_consume(&lexer, 'x'){
+                    for match_consume_hex_dig(&lexer) || match_consume(&lexer, '_'){}
+                    
+                    start_i := lexer.begin_i;
+                    end_i_excl := lexer.position;
+                    
+                    value := int_literal_t(parse_hex_literal(lexer.bytes[start_i:end_i_excl]))
+                    append(&tokens, value);
+                }else{
+                    // ignore floats for now
 
-            case '1'..='9': {}
+                    // I allow a leading zero (because I can)
+                    for match_consume_digit(&lexer) || match_consume(&lexer, '_'){}
+
+                    start_i := lexer.begin_i;
+                    end_i_excl := lexer.position;
+                    
+                    value := int_literal_t(parse_decimal_literal(lexer.bytes[start_i:end_i_excl]))
+                    append(&tokens, value);
+                }
+            }
+
+            case '1'..='9': {
+                // ignore floats for now
+                for match_consume_digit(&lexer) || match_consume(&lexer, '_'){}
+
+                start_i := lexer.begin_i;
+                end_i_excl := lexer.position;
+                
+                value := int_literal_t(parse_decimal_literal(lexer.bytes[start_i:end_i_excl]))
+                append(&tokens, value);
+            }
 
             case '"': {}
 
