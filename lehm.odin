@@ -405,7 +405,31 @@ tokenize :: proc(buf: []u8) -> [dynamic]token_t {
                 append(&tokens, value);
             }
 
-            case '"': {}
+            case '"': {
+                d :u8;
+                loop: for {
+                    d = consume(&lexer)
+                    switch d {
+                        case '"':
+                            break loop
+                        case '!'..='~':
+                        // do whatever now
+                        case: break loop;
+                    }
+                }
+
+                if d != '"'{
+                    fmt.printf("%c", d)
+                    panic("malformed string literal")
+                }
+
+                start_i := lexer.begin_i;
+                end_i_excl := lexer.position;
+                
+                str_lit := string_literal_t(lexer.bytes[start_i+1:end_i_excl-1])
+
+                append(&tokens, str_lit)
+            }
 
             case ' ' , '\n' , '\r' , '\t' : {}
         }
