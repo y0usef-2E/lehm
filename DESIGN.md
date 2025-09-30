@@ -22,3 +22,16 @@
 - afterwards, implement portable register-based VM.
 
 # Syntax and Grammar (Specifics)
+Program = Stmt* EOF;
+Stmt = Decl | Expr-Stmt
+Decl = Const-Decl | Var-Decl
+Const-Decl = Identifier "::" Literal
+Var-Decl = Identifier ":" (Identifier)? "=" Expr
+Expr-Stmt = Expr ";"
+Expr = Logical-Expr "if" Expr "," Expr | Logical-Expr
+Logical-Expr = Binary-Expr Connective Logical-Expr | Binary-Expr
+Binary-Expr = Unary-Expr Arithmetic-Op Binary-Expr | Unary-Expr
+Unary-Expr = Unary-Op Unary-Expr | Primary-Expr
+Primary-Expr = "(" Expr ")" | Literal | Identifier
+Literal = StringLit | IntLit | CharLit
+Identifier = ?

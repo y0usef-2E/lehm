@@ -52,6 +52,8 @@ simple_token_t :: enum {
 
     BANG,      // !
     BANG_EQ,   // !=
+
+    EOF
 }
 
 builtin_t :: enum {
@@ -105,7 +107,14 @@ main :: proc(){
     n, _ := os.read_full(handle, bytes[:]);
 
     tokens := tokenize(bytes[:])
-    fmt.println(tokens)
+    parser:= parser_t{
+        tokens=tokens[:], position=0
+    }
+    stmt : stmt_t;
+    for stmt := parse_stmt(&parser); stmt != nil; stmt = parse_stmt(&parser){
+        fmt.println(stmt)
+    }
+    assert(consume_token(&parser, simple_token_t.EOF))
 }
 
 
@@ -435,13 +444,160 @@ tokenize :: proc(buf: []u8) -> [dynamic]token_t {
         }
     }
 
+    append(&tokens, simple_token_t.EOF)
     return tokens
 }
 
-parse :: proc(tokens : [dynamic]token_t ){
-    token := tokens[0]
-    #partial switch type in token {
-        case identifier_t: {}
-        case:
+parser_t :: struct {
+    tokens: []token_t,
+    position: uint,
+}
+
+consume_token :: proc(parser: ^parser_t, t: token_t) -> bool{
+    pos := parser.position
+    if parser.tokens[pos] == t {
+        parser.position+=1
+        return true
     }
+    return false
+}
+
+peek_token :: proc(parser: ^parser_t, t: token_t, amt: uint) -> bool{
+    return parser.tokens[parser.position + amt] == t 
+}
+
+consume_identifier :: proc(parser: ^parser_t, ident: ^identifier_t) -> bool{
+    pos := parser.position
+    #partial switch token in parser.tokens[pos]  {
+        case identifier_t:
+            parser.position+=1
+            ident^ = token
+            return true 
+        case: 
+            return false
+    }
+    
+}
+
+expr_t :: union {
+    ifexpr_t, 
+    binexpr_t,
+    unexpr_t,
+    int_literal_t,
+    char_literal_t,
+    float_literal_t,
+    string_literal_t,
+    identifier_t,
+}
+
+stmt_t :: union {
+    cdecl_t,
+    vdecl_t,
+    exprstmt_t
+}
+
+cdecl_t :: struct{
+    name: identifier_t,
+    value: expr_t
+}
+
+vdecl_t :: struct{
+    name: identifier_t,
+    value: expr_t
+}
+
+exprstmt_t :: struct {inner: expr_t}
+
+ifexpr_t :: struct {
+    cond: ^expr_t,
+    then: ^expr_t,
+    otherwise: ^expr_t
+}
+
+binexpr_t :: struct{
+    left: ^expr_t,
+    op: binop_t,
+    right: ^expr_t
+}
+
+unexpr_t :: struct{
+    op: unop_t ,
+    inner: ^expr_t
+}
+
+unop_t :: enum{
+    NOT, COMPLEMENT
+}
+
+binop_t :: enum{
+    ADD, SUB, MULT, DIV
+}
+
+
+parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
+    varname: identifier_t;
+    typename: identifier_t;
+
+    #partial switch token in parser.tokens[parser.position] {
+        case identifier_t: {
+            varname = token
+            if peek_token(parser, simple_token_t.COLON, 1){
+                parser.position+=2;
+                if consume_token(parser, simple_token_t.COLON){
+                    // ConstDecl
+                    decl : cdecl_t;
+                    #partial switch expr in parser.tokens[parser.position]{
+	                  case  int_literal_t:    
+                        decl =  cdecl_t {
+                            name=varname, value=expr
+                        }
+                      case  string_literal_t:
+                        decl = cdecl_t {
+                            name=varname, value=expr
+                        }
+                        case: panic("unexpected constant")
+                    }
+                    parser.position+=1;
+                    if !consume_token(parser, simple_token_t.SEMI_COLON){
+                        panic("malformed const declaration")
+                    }
+                    return decl
+                }else if consume_token(parser, simple_token_t.EQ){
+                    // VarDecl
+                    value := parse_expr(parser)
+                    
+                    if !consume_token(parser, simple_token_t.SEMI_COLON){
+                        panic("malformed var declaration")
+                    }
+                    
+                    return vdecl_t{
+                        name=varname, value=value
+                    }
+
+                }else if consume_identifier(parser, &typename){
+                    if consume_token(parser, simple_token_t.EQ){
+                        // VarDecl
+                    }
+                }
+
+                
+            }
+        }
+    }
+
+    expr := parse_expr(parser)
+    if  expr != nil && consume_token(parser, simple_token_t.SEMI_COLON){
+        return exprstmt_t {expr}
+    }
+    
+    return nil
+}
+
+parse_expr :: proc(parser: ^parser_t) -> expr_t{
+    #partial switch token in parser.tokens[parser.position]{
+        case int_literal_t:
+            parser.position+=1;
+            return token
+    }
+    return nil 
 }
