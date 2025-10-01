@@ -109,7 +109,7 @@ main :: proc(){
     n, _ := os.read_full(handle, bytes[:]);
 
     tokens := tokenize(bytes[:])
-    fmt.println(tokens)
+    
     nodes := [4096]expr_t{}
     parser:= parser_t{
         tokens=tokens[:], position=0, nodes=nodes[:], next_node=0, ptable=[32]u8{}
@@ -768,9 +768,32 @@ parse_binexpr :: proc(parser: ^parser_t, min_prec: u8) -> expr_t{
     
 }
 
+peek_unop :: proc(parser: ^parser_t)->unop_t{
+    using unop_t 
+
+     switch parser.tokens[parser.position]{
+        case simple_token_t.TILDE:
+            return COMPLEMENT
+        case simple_token_t.BANG:
+            return NOT
+    }
+
+    return unop_t.NONE
+}
+
 parse_unexpr :: proc(parser: ^parser_t) -> expr_t{
-    primexpr := parse_prim(parser)
-    return primexpr
+    unop := peek_unop(parser)
+    if unop != unop_t.NONE{
+        advance(parser)
+        inner := parse_unexpr(parser)
+        return unexpr_t{
+            op=unop, inner=boxed_node(parser, inner)
+        }
+    }else{
+        inner := parse_prim(parser)
+        return inner
+    }
+    
 }
 
 parse_prim :: proc(parser: ^parser_t) -> expr_t{
