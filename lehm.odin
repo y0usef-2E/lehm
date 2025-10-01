@@ -93,6 +93,8 @@ lexer_t :: struct{
 }
 
 main :: proc(){
+    using binop_t
+
     test := "0b1111_1111"
     assert(parse_binary_literal(transmute([]u8)test) == 255)
     test2 := "0b111"
@@ -107,9 +109,15 @@ main :: proc(){
     n, _ := os.read_full(handle, bytes[:]);
 
     tokens := tokenize(bytes[:])
+    fmt.println(tokens)
+    nodes := [4096]expr_t{}
     parser:= parser_t{
-        tokens=tokens[:], position=0
+        tokens=tokens[:], position=0, nodes=nodes[:], next_node=0, ptable=[32]u8{}
     }
+    init_precedence(&parser) 
+    
+    assert(parser.ptable[binop_t.MULT] == 50)
+
     stmt : stmt_t;
     for stmt := parse_stmt(&parser); stmt != nil; stmt = parse_stmt(&parser){
         fmt.println(stmt)
@@ -117,6 +125,29 @@ main :: proc(){
     assert(consume_token(&parser, simple_token_t.EOF))
 }
 
+init_precedence :: proc(parser: ^parser_t){
+    using binop_t
+    t := parser.ptable[:]
+    t[MULT] = 50
+    t[DIV]= 50
+    t[REM] = 50
+
+    t[ADD] = 45
+    t[SUB] = 45
+
+    t[LT] = 35
+    t[LTE]= 35
+    t[GT]= 35
+    t[GTE]= 35
+
+    t[EQ] = 30
+    t[NEQ]= 30
+
+    t[LAND]=10
+    
+    t[LOR] = 5
+
+}
 
 map_char :: proc (c: u8) -> simple_token_t {
     using simple_token_t;
@@ -161,6 +192,7 @@ can_double :: proc(c: u8) -> simple_token_t{
         case '-': return MINUS_MINUS;
         case '<': return LESS_LESS;
         case '>': return GREAT_GREAT;
+        case '&': return AMP_AMP;
         case: return nil
     };
 }
@@ -318,7 +350,7 @@ tokenize :: proc(buf: []u8) -> [dynamic]token_t {
 
         switch c {
 
-            case '#', '.', '~', '|','%','+','/','\\','*','-','{','}','[',']','(',')',':',';',',','^': {
+            case '&', '#', '.', '~', '|','%','+','/','\\','*','-','{','}','[',']','(',')',':',';',',','^': {
                 t := can_double(c)
                 if t != nil && match_consume(&lexer, c){
                     append(&tokens, t)
@@ -367,9 +399,14 @@ tokenize :: proc(buf: []u8) -> [dynamic]token_t {
 
                 start_i := lexer.begin_i;
                 end_i_excl := lexer.position;
-                ident := identifier_t(lexer.bytes[start_i:end_i_excl]);
-
-                append(&tokens, ident);
+                str := string(lexer.bytes[start_i:end_i_excl])
+                reserved := builtins[str]
+                if reserved != nil {
+                    append(&tokens, reserved)
+                }else{
+                    ident := identifier_t(str);
+                    append(&tokens, ident);
+                }
             }
             
             case '0': {
@@ -451,6 +488,9 @@ tokenize :: proc(buf: []u8) -> [dynamic]token_t {
 parser_t :: struct {
     tokens: []token_t,
     position: uint,
+    nodes: []expr_t,
+    next_node: uint,
+    ptable: [32]u8
 }
 
 consume_token :: proc(parser: ^parser_t, t: token_t) -> bool{
@@ -515,8 +555,8 @@ ifexpr_t :: struct {
 }
 
 binexpr_t :: struct{
-    left: ^expr_t,
     op: binop_t,
+    left: ^expr_t,
     right: ^expr_t
 }
 
@@ -526,11 +566,18 @@ unexpr_t :: struct{
 }
 
 unop_t :: enum{
+    NONE = 0,
     NOT, COMPLEMENT
 }
 
+precedence :: [32]uint{}
+
 binop_t :: enum{
-    ADD, SUB, MULT, DIV
+    NONE = 0,
+    LT, LTE, GT, GTE, NEQ, EQ, LAND, LOR,
+    
+    LSHIFT, RSHIFT, BAND, BOR,
+    ADD, SUB, MULT, DIV, REM
 }
 
 
@@ -593,11 +640,151 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
     return nil
 }
 
+
+boxed_node :: proc(parser: ^parser_t, node: expr_t) -> ^expr_t{
+    at :=parser.next_node 
+    parser.nodes[at] = node
+    parser.next_node+=1;
+
+    return &parser.nodes[at]
+}
+
 parse_expr :: proc(parser: ^parser_t) -> expr_t{
+    logexpr := parse_logexpr(parser, DEF_MINPREC);
+    if consume_token(parser, builtin_t.IF){
+        then := parse_expr(parser)
+        if then == nil {panic("malformed if-expression")}
+        if consume_token(parser, simple_token_t.COMMA){   
+            otherwise := parse_expr(parser)
+            return ifexpr_t{
+                cond=boxed_node(parser, logexpr),
+                then=boxed_node(parser, then),
+                otherwise=boxed_node(parser, otherwise)
+            }
+        }
+        panic("malformed if-expression")
+    }
+    
+    return logexpr
+}
+
+peek_connective :: proc(parser:^parser_t) -> binop_t {
+    using binop_t
+    
+    switch parser.tokens[parser.position]{
+        case simple_token_t.LESS:
+            return LT 
+        case simple_token_t.LESS_EQ:
+            return LTE
+        case simple_token_t.GREAT:
+            return GT 
+        case simple_token_t.GREAT_EQ:
+            return GTE 
+        case simple_token_t.EQ_EQ:
+            return EQ 
+        case simple_token_t.BANG_EQ:
+            return NEQ
+        case simple_token_t.AMP_AMP:
+            return LAND 
+        case simple_token_t.PIPE_PIPE:
+            return LOR
+    }
+
+    return binop_t.NONE
+}
+
+DEF_MINPREC :u8 : 0
+
+advance :: proc(parser: ^parser_t){
+    parser.position+=1;
+}
+
+parse_logexpr :: proc(parser: ^parser_t, min_prec: u8) -> expr_t{
+    left := parse_binexpr(parser, DEF_MINPREC);
+    if left == nil{return nil}
+    binop := peek_connective(parser)
+    for binop != binop_t.NONE{
+        prec :=  parser.ptable[binop]
+        
+        if prec >= min_prec{
+            advance(parser)
+
+            right := parse_logexpr(parser, prec+1)
+
+            left = binexpr_t{
+                op=binop, left=boxed_node(parser, left), right=boxed_node(parser, right)
+            }
+            binop=peek_connective(parser)
+        }else{
+            break;
+        }
+    }
+    
+    return left
+}
+
+peek_arithop :: proc(parser: ^parser_t) -> binop_t{
+    using binop_t
+    
+    switch parser.tokens[parser.position]{
+        case simple_token_t.PLUS:
+            return ADD 
+        case simple_token_t.MINUS:
+            return SUB 
+        case simple_token_t.DIV_FSLASH:
+            return DIV 
+        case simple_token_t.STAR:
+            return MULT 
+        case simple_token_t.PERCENT:
+            return REM
+    }
+
+    return binop_t.NONE
+}
+
+parse_binexpr :: proc(parser: ^parser_t, min_prec: u8) -> expr_t{
+    left := parse_unexpr(parser); 
+    if left == nil{return nil}
+
+    binop := peek_arithop(parser)
+    for binop != binop_t.NONE{
+        prec :=  parser.ptable[binop]
+        
+        if prec >= min_prec{
+            advance(parser)
+
+            right := parse_binexpr(parser, prec+1)
+
+            left = binexpr_t{
+                op=binop, left=boxed_node(parser, left), right=boxed_node(parser, right)
+            }
+            binop=peek_arithop(parser)
+        }else{
+            break;
+        }
+    }
+    
+    return left
+    
+}
+
+parse_unexpr :: proc(parser: ^parser_t) -> expr_t{
+    primexpr := parse_prim(parser)
+    return primexpr
+}
+
+parse_prim :: proc(parser: ^parser_t) -> expr_t{
     #partial switch token in parser.tokens[parser.position]{
         case int_literal_t:
-            parser.position+=1;
+            advance(parser)
+            return token
+        case string_literal_t:
+            advance(parser)
+            return token
+        case char_literal_t:
+            advance(parser)
             return token
     }
-    return nil 
+
+    return nil
 }
