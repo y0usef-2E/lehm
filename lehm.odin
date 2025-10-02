@@ -846,7 +846,11 @@ parse_prim :: proc(parser: ^parser_t) -> expr_t{
                                     panic("malformed struct decl")
                                 }
                             }
+                        }else{
+                            panic("malformed struct decl")    
                         }
+                    }else{
+                        panic("malformed struct decl")
                     }
                 }
                 if consume_token(parser, simple_token_t.RIGHT_CURLY){
