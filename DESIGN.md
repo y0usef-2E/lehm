@@ -24,13 +24,17 @@
 # Syntax and Grammar (Specifics)
 Program = Stmt* EOF;
 
-Stmt = Decl | Expr-Stmt
+Stmt = Decl | Assignment | Expr-Stmt | Block
 
 Decl = Const-Decl | Var-Decl
 
-Const-Decl = Identifier "::" Literal
+Const-Decl = Identifier "::" Const-Value ";"
 
-Var-Decl = Identifier ":" (Identifier)? "=" Expr
+Const-Value = Literal-Token | Array-Literal | Struct-Decl | Enum-Decl | Func-Decl
+
+Var-Decl = Identifier ":" (Identifier)? "=" Expr ";"
+
+Assignment = Identifier "=" Expr ";"
 
 Expr-Stmt = Expr ";"
 
@@ -42,8 +46,8 @@ Binary-Expr = Unary-Expr Arithmetic-Op Binary-Expr | Unary-Expr
 
 Unary-Expr = Unary-Op Unary-Expr | Primary-Expr
 
-Primary-Expr = "(" Expr ")" | Literal | Identifier
+Primary-Expr = "(" Expr ")" | Literal-Token | Identifier
 
-Literal = StringLit | IntLit | CharLit
+Literal-Token = String-Literal | Int-Literal | Char-Literal
 
 Identifier = ?

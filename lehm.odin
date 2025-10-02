@@ -61,7 +61,8 @@ builtin_t :: enum {
 
     IF,
     WHILE,
-    FOR, 
+    FOR,
+    FN,
     STRUCT, 
     ENUM,
 }
@@ -336,6 +337,7 @@ tokenize :: proc(buf: []u8) -> [dynamic]token_t {
             "while" = WHILE, 
             "if"= IF,
             "struct" = STRUCT, 
+            "fn" = FN,
             "enum"= ENUM,
         }
     } 
@@ -528,6 +530,20 @@ expr_t :: union {
     float_literal_t,
     string_literal_t,
     identifier_t,
+    struct_info_t,
+    function_info_t,
+    enum_info_t
+}
+
+struct_info_t :: struct{
+    // layout (alignment, ...) later
+    self: map[identifier_t]identifier_t
+}
+function_info_t :: struct{
+
+}
+enum_info_t :: struct{
+
 }
 
 stmt_t :: union {
@@ -592,23 +608,15 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                 parser.position+=2;
                 if consume_token(parser, simple_token_t.COLON){
                     // ConstDecl
-                    decl : cdecl_t;
-                    #partial switch expr in parser.tokens[parser.position]{
-	                  case  int_literal_t:    
-                        decl =  cdecl_t {
-                            name=varname, value=expr
-                        }
-                      case  string_literal_t:
-                        decl = cdecl_t {
-                            name=varname, value=expr
-                        }
-                        case: panic("unexpected constant")
-                    }
-                    parser.position+=1;
+                    value := parse_expr(parser)
+                    
                     if !consume_token(parser, simple_token_t.SEMI_COLON){
                         panic("malformed const declaration")
                     }
-                    return decl
+
+                    return cdecl_t{
+                        varname, value
+                    }
                 }else if consume_token(parser, simple_token_t.EQ){
                     // VarDecl
                     value := parse_expr(parser)
@@ -797,7 +805,9 @@ parse_unexpr :: proc(parser: ^parser_t) -> expr_t{
 }
 
 parse_prim :: proc(parser: ^parser_t) -> expr_t{
-    #partial switch token in parser.tokens[parser.position]{
+    // TODO(yousef): identifiers and parentheses
+    next := parser.tokens[parser.position]
+    #partial switch token in next{
         case int_literal_t:
             advance(parser)
             return token
@@ -807,6 +817,53 @@ parse_prim :: proc(parser: ^parser_t) -> expr_t{
         case char_literal_t:
             advance(parser)
             return token
+        case identifier_t:
+            advance(parser)
+            return token
+    }
+    
+    switch next{
+        case builtin_t.ENUM, builtin_t.FN:
+            panic("unimplemented!")
+        case builtin_t.STRUCT:{
+            advance(parser)
+            info: map[identifier_t]identifier_t
+            if consume_token(parser, simple_token_t.LEFT_CURLY){
+                key: identifier_t;
+                for consume_identifier(parser, &key){
+                    if consume_token(parser, simple_token_t.COLON){
+                        type : identifier_t;
+                        if consume_identifier(parser, &type){
+                            info[key]=type
+                            if consume_token(parser, simple_token_t.COMMA){
+                                if peek_token(parser, simple_token_t.RIGHT_CURLY, 0){
+                                    break;
+                                }
+                            }else{
+                                if peek_token(parser, simple_token_t.RIGHT_CURLY, 0 ){
+                                    break;
+                                }else{
+                                    panic("malformed struct decl")
+                                }
+                            }
+                        }
+                    }
+                }
+                if consume_token(parser, simple_token_t.RIGHT_CURLY){
+                    return struct_info_t{info}
+                }
+            }
+            panic("malformed struct decl")    
+        }
+    }
+    if consume_token(parser, simple_token_t.LEFT_PAREN){
+        inner := parse_expr(parser)
+        if consume_token(parser, simple_token_t.RIGHT_PAREN){
+            if inner == nil{
+                panic("malformed expression (paren)")
+            }
+            return inner
+        }
     }
 
     return nil
