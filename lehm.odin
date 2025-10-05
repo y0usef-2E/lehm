@@ -35,6 +35,7 @@ simple_token_t :: enum {
     PERCENT,    // %
 
     EQ_ARROW,     // =>
+    MINUS_ARROW, // ->
 
     AMP, // &
     AMP_AMP,   // &&
@@ -65,6 +66,7 @@ builtin_t :: enum {
     FN,
     STRUCT, 
     ENUM,
+    RETURN,
 }
 
 identifier_t :: distinct string
@@ -101,7 +103,6 @@ main :: proc(){
     test2 := "0b111"
     assert(parse_binary_literal(transmute([]u8)test2) == 7)
 
-
     handle, err := os.open("./tests/one.lh")
     if err != nil{
         panic("cannot find file"); 
@@ -111,9 +112,10 @@ main :: proc(){
 
     tokens := tokenize(bytes[:])
     
-    nodes := [4096]expr_t{}
+    nodes := make([]expr_t, 4096)
+
     parser:= parser_t{
-        tokens=tokens[:], position=0, nodes=nodes[:], next_node=0, ptable=[32]u8{}
+        tokens=tokens[:], position=0, nodes=nodes, next_node=0, ptable=[32]u8{}
     }
     init_precedence(&parser) 
     
@@ -339,6 +341,7 @@ tokenize :: proc(buf: []u8) -> [dynamic]token_t {
             "struct" = STRUCT, 
             "fn" = FN,
             "enum"= ENUM,
+            "return" = RETURN
         }
     } 
 
@@ -352,12 +355,22 @@ tokenize :: proc(buf: []u8) -> [dynamic]token_t {
 
         switch c {
 
-            case '&', '#', '.', '~', '|','%','+','/','\\','*','-','{','}','[',']','(',')',':',';',',','^': {
+            case '&', '#', '.', '~', '|','%','+','/','\\','*','{','}','[',']','(',')',':',';',',','^': {
                 t := can_double(c)
                 if t != nil && match_consume(&lexer, c){
                     append(&tokens, t)
                 }else{
                     append(&tokens, map_char(c))
+                }
+            }
+
+            case '-':{
+                if match_consume(&lexer, '-'){
+                    append(&tokens, simple_token_t.MINUS_MINUS)
+                } else if match_consume(&lexer, '>'){
+                    append(&tokens, simple_token_t.MINUS_ARROW)
+                }else{
+                    append(&tokens, simple_token_t.MINUS)
                 }
             }
             case '=': {
@@ -521,8 +534,20 @@ consume_identifier :: proc(parser: ^parser_t, ident: ^identifier_t) -> bool{
     
 }
 
+peek_identifier :: proc(parser: ^parser_t, ident: ^identifier_t) -> bool{
+    pos := parser.position
+    #partial switch token in parser.tokens[pos]  {
+        case identifier_t:
+            ident^ = token
+            return true 
+        case: 
+            return false
+    }
+}
+
 expr_t :: union {
-    ifexpr_t, 
+    ifexpr_t,
+    assign_t,
     binexpr_t,
     unexpr_t,
     int_literal_t,
@@ -531,17 +556,31 @@ expr_t :: union {
     string_literal_t,
     identifier_t,
     struct_info_t,
-    function_info_t,
+    func_info_t,
+    proto_t,
     enum_info_t
+}
+
+assign_t :: struct{
+    varname: identifier_t,
+    lexpr: ^expr_t
 }
 
 struct_info_t :: struct{
     // layout (alignment, ...) later
     self: map[identifier_t]identifier_t
 }
-function_info_t :: struct{
 
+proto_t :: struct{
+    args: map[identifier_t]identifier_t,
+    ret_type: identifier_t
 }
+
+func_info_t :: struct{
+    proto: proto_t,
+    body: []stmt_t
+}
+
 enum_info_t :: struct{
 
 }
@@ -549,6 +588,7 @@ enum_info_t :: struct{
 stmt_t :: union {
     cdecl_t,
     vdecl_t,
+    return_t,
     exprstmt_t
 }
 
@@ -560,6 +600,10 @@ cdecl_t :: struct{
 vdecl_t :: struct{
     name: identifier_t,
     value: expr_t
+}
+
+return_t :: struct{
+    inner: expr_t
 }
 
 exprstmt_t :: struct {inner: expr_t}
@@ -601,7 +645,9 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
     varname: identifier_t;
     typename: identifier_t;
 
-    #partial switch token in parser.tokens[parser.position] {
+    current := parser.tokens[parser.position]
+
+    #partial switch token in current {
         case identifier_t: {
             varname = token
             if peek_token(parser, simple_token_t.COLON, 1){
@@ -638,6 +684,20 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                 
             }
         }
+
+        case builtin_t:{
+            if current==builtin_t.RETURN{
+                advance(parser)
+                inner := parse_expr(parser)
+                if consume_token(parser, simple_token_t.SEMI_COLON){
+                    return return_t{
+                        inner
+                    }
+                }else{
+                    panic("malformed return stmt.")
+                }
+            }
+        }
     }
 
     expr := parse_expr(parser)
@@ -658,6 +718,20 @@ boxed_node :: proc(parser: ^parser_t, node: expr_t) -> ^expr_t{
 }
 
 parse_expr :: proc(parser: ^parser_t) -> expr_t{
+    some_ident: identifier_t;
+    if peek_identifier(parser, &some_ident){
+        if peek_token(parser, simple_token_t.EQ, 1){
+            parser.position+=2;
+            lexpr := boxed_node(parser, parse_expr(parser))
+            if !consume_token(parser, simple_token_t.SEMI_COLON){
+                panic("malformed assignment")
+            }
+            return assign_t{
+                some_ident, lexpr
+            }
+        }
+    }
+
     logexpr := parse_logexpr(parser, DEF_MINPREC);
     if consume_token(parser, builtin_t.IF){
         then := parse_expr(parser)
@@ -672,6 +746,8 @@ parse_expr :: proc(parser: ^parser_t) -> expr_t{
         }
         panic("malformed if-expression")
     }
+    
+
     
     return logexpr
 }
@@ -823,8 +899,77 @@ parse_prim :: proc(parser: ^parser_t) -> expr_t{
     }
     
     switch next{
-        case builtin_t.ENUM, builtin_t.FN:
+        case builtin_t.ENUM:
             panic("unimplemented!")
+        
+        case builtin_t.FN:
+            advance(parser)
+            args : map[identifier_t]identifier_t;
+            if consume_token(parser, simple_token_t.LEFT_PAREN){
+                key: identifier_t;
+                for consume_identifier(parser, &key){
+                    if consume_token(parser, simple_token_t.COLON){
+                        type : identifier_t;
+                        if consume_identifier(parser, &type){
+                            args[key]=type
+                            if consume_token(parser, simple_token_t.COMMA){
+                                if peek_token(parser, simple_token_t.RIGHT_PAREN, 0){
+                                    break;
+                                }
+                            }else{
+                                if peek_token(parser, simple_token_t.RIGHT_PAREN, 0 ){
+                                    break;
+                                }else{
+                                    panic("malformed arg list")
+                                }
+                            }
+                        }else{
+                            panic("malformed arg list")    
+                        }
+                    }else{
+                        panic("malformed struct decl")
+                    }
+                }
+                if !consume_token(parser, simple_token_t.RIGHT_PAREN){
+                    panic("malformed arg list")
+                }
+
+                body := make_dynamic_array_len([dynamic]stmt_t, 20);
+                prototype: proto_t = {args, identifier_t("void")}
+                
+                if consume_token(parser, simple_token_t.MINUS_ARROW){
+                    ident: identifier_t;
+                    if consume_identifier(parser, &ident){
+                        prototype.ret_type = ident
+                    }else{
+                        panic("malformed function declaration")
+                    }
+                }
+                
+                if consume_token(parser, simple_token_t.LEFT_CURLY){
+                    s: stmt_t = parse_stmt(parser)
+                    for {
+                        if s == nil{
+                            if consume_token(parser, simple_token_t.RIGHT_CURLY){
+                                break;
+                            }else{
+                                panic("malformed function declaration")
+                            }
+                            
+                        }else{
+                            append(&body, s)
+                            s= parse_stmt(parser)
+                        }
+                    }
+
+                    return func_info_t{
+                        prototype, body[:]
+                    }
+                }else{
+                    return prototype;
+                }
+            }
+            
         case builtin_t.STRUCT:{
             advance(parser)
             info: map[identifier_t]identifier_t
