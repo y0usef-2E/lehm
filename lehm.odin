@@ -123,8 +123,11 @@ main :: proc(){
 
     stmt : stmt_t;
     for stmt := parse_stmt(&parser); stmt != nil; stmt = parse_stmt(&parser){
-        fmt.println(stmt)
+        buf := naive_ir(stmt)
+        str := format_ir_buffer(buf)
+        fmt.println(str)
     }
+
     assert(consume_token(&parser, simple_token_t.EOF))
 }
 
@@ -603,7 +606,7 @@ vdecl_t :: struct{
 }
 
 return_t :: struct{
-    inner: expr_t
+    inner: ^expr_t
 }
 
 exprstmt_t :: struct {inner: expr_t}
@@ -640,6 +643,21 @@ binop_t :: enum{
     ADD, SUB, MULT, DIV, REM
 }
 
+ir_var_t :: struct {name: u32, ver: u32};
+
+ir_value_t :: union{ir_var_t, int_literal_t}
+
+ir_binary_t :: struct {op: binop_t, left: ir_value_t, right: ir_value_t, dest: ir_var_t}
+
+ir_unary_t :: struct{op: unop_t, src: ir_value_t, dest: ir_var_t}
+
+ir_emit_t :: struct{value: ir_value_t}
+
+ir_instruction_t :: union{
+    ir_unary_t,
+    ir_binary_t,
+    ir_emit_t
+}
 
 parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
     varname: identifier_t;
@@ -688,7 +706,7 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
         case builtin_t:{
             if current==builtin_t.RETURN{
                 advance(parser)
-                inner := parse_expr(parser)
+                inner :=boxed_node(parser, parse_expr(parser))
                 if consume_token(parser, simple_token_t.SEMI_COLON){
                     return return_t{
                         inner
@@ -1016,4 +1034,100 @@ parse_prim :: proc(parser: ^parser_t) -> expr_t{
     }
 
     return nil
+}
+
+naive_ir :: proc(stmt: stmt_t) -> []ir_instruction_t {
+    instructions := make_dynamic_array([dynamic]ir_instruction_t);
+
+
+    transform_stmt(stmt, &instructions)
+    
+
+    return instructions[:len(instructions)];
+}
+
+transform_stmt :: proc(stmt: stmt_t, ir_buf: ^[dynamic]ir_instruction_t) {
+    #partial switch type in stmt{
+        case return_t: {
+            counter : u32 = 0; 
+            val := transform_expr(stmt.(return_t).inner, &counter, ir_buf)
+            append(ir_buf, ir_emit_t {value=val })
+        }
+        case: panic("unimplemented!")
+    }
+}
+
+transform_expr :: proc(expr: ^expr_t, counter: ^u32, ir_buf: ^[dynamic]ir_instruction_t)-> ir_value_t {
+    #partial switch type in expr{
+        case int_literal_t: {
+            return expr.(int_literal_t)
+        }
+
+        case binexpr_t:{
+            this :=expr.(binexpr_t); 
+            temp := counter^
+            counter^+=1
+            src_left := transform_expr(this.left, counter, ir_buf);
+            dest := ir_var_t{name=temp, ver=0}
+
+            src_right := transform_expr(this.right, counter, ir_buf);
+            instruction : ir_instruction_t = ir_binary_t{
+                op=this.op,
+                left=src_left,
+                right=src_right,
+                dest=dest
+            };
+
+            append(ir_buf, instruction)
+            return dest
+        }
+
+        case: panic("unimplemented!")
+    }
+}
+
+import "core:strings"
+
+format_value :: proc(sbuilder: ^strings.Builder, val: ir_value_t){
+    switch type in val{
+        case ir_var_t:{           
+            fmt.sbprintf(sbuilder, "tmp%d.%d", val.(ir_var_t).name, val.(ir_var_t).ver)    
+        }
+    
+        case int_literal_t:{
+            fmt.sbprintf(sbuilder, "CONST(%d)", val.(int_literal_t))
+        }
+    }
+}
+
+// for debugging (whatever)
+format_ir_buffer :: proc(ir_buf: []ir_instruction_t) -> string{
+    string_builder := strings.builder_make()
+    for instruction in ir_buf {
+        switch type in instruction{
+            case ir_emit_t:{
+                fmt.sbprint(&string_builder, "EMIT ")
+                format_value(&string_builder, instruction.(ir_emit_t).value);
+                fmt.sbprint(&string_builder, "\n")
+            }
+            case ir_binary_t:{
+                bin := instruction.(ir_binary_t)
+                format_value(&string_builder, bin.dest)
+                fmt.sbprint(&string_builder, " = ")                
+                fmt.sbprint(&string_builder, bin.op)
+                fmt.sbprint(&string_builder, " ")
+                format_value(&string_builder, bin.left)
+                fmt.sbprint(&string_builder, ", ")
+                format_value(&string_builder, bin.right)
+                
+                fmt.sbprint(&string_builder, "\n")
+            }
+
+            case ir_unary_t:{
+                panic("unimplemented");
+            }
+        }
+    }
+
+    return strings.to_string(string_builder)
 }
