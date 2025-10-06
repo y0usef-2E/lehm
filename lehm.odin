@@ -645,7 +645,7 @@ binop_t :: enum{
 
 ir_var_t :: struct {name: u32, ver: u32};
 
-ir_value_t :: union{ir_var_t, int_literal_t}
+ir_value_t :: union{ir_var_t, int_literal_t, ir_phony_t}
 
 ir_binary_t :: struct {op: binop_t, left: ir_value_t, right: ir_value_t, dest: ir_var_t}
 
@@ -653,10 +653,28 @@ ir_unary_t :: struct{op: unop_t, src: ir_value_t, dest: ir_var_t}
 
 ir_emit_t :: struct{value: ir_value_t}
 
+ir_label_t :: struct{id: u32, name: string}
+
+ir_jump_label_t :: struct{to: ir_label_t}
+
+ir_jz_label_t :: struct{test: ir_value_t, to: ir_label_t}
+
+ir_emit_label_t :: struct{is: ir_label_t}
+
+ir_copy_t :: struct{src: ir_value_t, dest: ir_value_t}
+
 ir_instruction_t :: union{
     ir_unary_t,
     ir_binary_t,
-    ir_emit_t
+    ir_emit_t,
+    ir_jump_label_t,
+    ir_jz_label_t, 
+    ir_emit_label_t,
+    ir_copy_t
+}
+
+ir_phony_t :: struct{
+    src: []ir_value_t,
 }
 
 parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
@@ -752,13 +770,13 @@ parse_expr :: proc(parser: ^parser_t) -> expr_t{
 
     logexpr := parse_logexpr(parser, DEF_MINPREC);
     if consume_token(parser, builtin_t.IF){
-        then := parse_expr(parser)
-        if then == nil {panic("malformed if-expression")}
+        cond := parse_expr(parser)
+        if cond == nil {panic("malformed if-expression")}
         if consume_token(parser, simple_token_t.COMMA){   
             otherwise := parse_expr(parser)
             return ifexpr_t{
-                cond=boxed_node(parser, logexpr),
-                then=boxed_node(parser, then),
+                then=boxed_node(parser, logexpr),
+                cond=boxed_node(parser, cond),
                 otherwise=boxed_node(parser, otherwise)
             }
         }
@@ -1049,15 +1067,35 @@ naive_ir :: proc(stmt: stmt_t) -> []ir_instruction_t {
 transform_stmt :: proc(stmt: stmt_t, ir_buf: ^[dynamic]ir_instruction_t) {
     #partial switch type in stmt{
         case return_t: {
-            counter : u32 = 0; 
-            val := transform_expr(stmt.(return_t).inner, &counter, ir_buf)
+            var_counter : u32 = 0; 
+            label_counter: u32 = 0;
+            nodes: =make([dynamic]ir_value_t)
+            state := ir_state_t{
+                label_counter=&label_counter,
+                var_counter=&var_counter,
+                nodes=&nodes
+            }
+            val := transform_expr(stmt.(return_t).inner, state, ir_buf)
             append(ir_buf, ir_emit_t {value=val })
         }
         case: panic("unimplemented!")
     }
 }
 
-transform_expr :: proc(expr: ^expr_t, counter: ^u32, ir_buf: ^[dynamic]ir_instruction_t)-> ir_value_t {
+append_label :: proc(label: ir_label_t, ir_buf: ^[dynamic]ir_instruction_t){
+    instr := ir_emit_label_t{is=label}
+    append(ir_buf, instr)
+}
+
+ir_state_t :: struct{
+    var_counter: ^u32, 
+    label_counter: ^u32,
+    nodes: ^[dynamic]ir_value_t,
+}
+
+transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_instruction_t)-> ir_value_t {
+    var_counter := state.var_counter;
+    label_counter := state.label_counter
     #partial switch type in expr{
         case int_literal_t: {
             return expr.(int_literal_t)
@@ -1065,12 +1103,12 @@ transform_expr :: proc(expr: ^expr_t, counter: ^u32, ir_buf: ^[dynamic]ir_instru
 
         case binexpr_t:{
             this :=expr.(binexpr_t); 
-            temp := counter^
-            counter^+=1
-            src_left := transform_expr(this.left, counter, ir_buf);
-            dest := ir_var_t{name=temp, ver=0}
+            tvar := var_counter^
+            var_counter^+=1
+            src_left := transform_expr(this.left, state, ir_buf);
+            dest := ir_var_t{name=tvar, ver=0}
 
-            src_right := transform_expr(this.right, counter, ir_buf);
+            src_right := transform_expr(this.right, state, ir_buf);
             instruction : ir_instruction_t = ir_binary_t{
                 op=this.op,
                 left=src_left,
@@ -1082,6 +1120,59 @@ transform_expr :: proc(expr: ^expr_t, counter: ^u32, ir_buf: ^[dynamic]ir_instru
             return dest
         }
 
+        case ifexpr_t:
+            
+            this := expr.(ifexpr_t)
+            
+            res_var: ir_var_t ={ var_counter^, 0}
+
+            var_counter^+=1
+            false_label := ir_label_t{label_counter^, "false"}
+            combine := ir_label_t{label_counter^+1, "combine"}
+            
+            label_counter^+=2
+            
+            cond := transform_expr(this.cond, state, ir_buf)
+            jz := ir_jz_label_t{
+                test=cond, to=false_label
+            }
+            append(ir_buf, jz)
+
+            then := transform_expr(this.then, state, ir_buf)
+            copy_tr := ir_copy_t{
+                src=then, dest=res_var
+            }
+            append(state.nodes, res_var)
+
+            append(ir_buf, copy_tr)
+            
+            j := ir_jump_label_t {
+                to=combine
+            }
+            append(ir_buf, j)
+            
+            append_label(false_label, ir_buf)
+            otherwise := transform_expr(this.otherwise, state, ir_buf)
+            res_var.ver+=1
+            copy_f := ir_copy_t{
+                src=otherwise, dest=res_var
+            }
+            append(state.nodes, res_var)
+            append(ir_buf, copy_f)
+
+            append_label(combine, ir_buf)
+            
+            phony := ir_phony_t{src=state.nodes[len(state.nodes)-2:len(state.nodes)]}
+            
+            res_var.ver+=1
+            
+            comb := ir_copy_t{
+                src=phony,dest=res_var
+            }
+
+            append(ir_buf, comb)
+
+            return res_var
         case: panic("unimplemented!")
     }
 }
@@ -1097,12 +1188,23 @@ format_value :: proc(sbuilder: ^strings.Builder, val: ir_value_t){
         case int_literal_t:{
             fmt.sbprintf(sbuilder, "CONST(%d)", val.(int_literal_t))
         }
+        case ir_phony_t:
+            fmt.sbprint(sbuilder, "phi(")
+            list := val.(ir_phony_t).src
+            for i in 0..<len(list){
+                format_value(sbuilder, list[i])
+                if i != len(list)-1{
+                    fmt.sbprint(sbuilder, ", ")
+                }
+            }
+            fmt.sbprint(sbuilder, ")")
     }
 }
 
 // for debugging (whatever)
 format_ir_buffer :: proc(ir_buf: []ir_instruction_t) -> string{
     string_builder := strings.builder_make()
+    fmt.sbprint(&string_builder, "\n")
     for instruction in ir_buf {
         switch type in instruction{
             case ir_emit_t:{
@@ -1122,7 +1224,35 @@ format_ir_buffer :: proc(ir_buf: []ir_instruction_t) -> string{
                 
                 fmt.sbprint(&string_builder, "\n")
             }
+            case ir_jump_label_t :{
+                j := instruction.(ir_jump_label_t)
+                fmt.sbprint(&string_builder, "JUMP $")
+                fmt.sbprintf(&string_builder, "%d.", j.to.id)
+                fmt.sbprint(&string_builder, j.to.name)
+                fmt.sbprintf(&string_builder, "\n")
+            }
 
+            case ir_jz_label_t : {
+                j := instruction.(ir_jz_label_t)
+                fmt.sbprint(&string_builder, "JZ(")
+                format_value(&string_builder, j.test)
+                fmt.sbprint(&string_builder, ") $")
+                fmt.sbprintf(&string_builder, "%d.", j.to.id)
+                fmt.sbprint(&string_builder, j.to.name)
+                fmt.sbprint(&string_builder, "\n")
+            }
+
+            case ir_emit_label_t:{
+                is := instruction.(ir_emit_label_t).is
+                fmt.sbprintf(&string_builder, "\n@%d.%s:\n", is.id, is.name)
+            }
+            case ir_copy_t: {
+                copy := instruction.(ir_copy_t)
+                format_value(&string_builder, copy.dest)
+                fmt.sbprint(&string_builder, " = ")    
+                format_value(&string_builder, copy.src)
+                fmt.sbprint(&string_builder, "\n")
+            }
             case ir_unary_t:{
                 panic("unimplemented");
             }
