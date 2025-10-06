@@ -581,18 +581,21 @@ proto_t :: struct{
 
 func_info_t :: struct{
     proto: proto_t,
-    body: []stmt_t
+    body: block_t
 }
 
-enum_info_t :: struct{
-
-}
+enum_info_t :: struct{}
 
 stmt_t :: union {
     cdecl_t,
     vdecl_t,
     return_t,
-    exprstmt_t
+    exprstmt_t,
+    block_t
+}
+
+block_t :: struct{
+    list: []stmt_t
 }
 
 cdecl_t :: struct{
@@ -609,7 +612,7 @@ return_t :: struct{
     inner: ^expr_t
 }
 
-exprstmt_t :: struct {inner: expr_t}
+exprstmt_t :: struct {inner: ^expr_t}
 
 ifexpr_t :: struct {
     cond: ^expr_t,
@@ -642,6 +645,8 @@ binop_t :: enum{
     LSHIFT, RSHIFT, BAND, BOR,
     ADD, SUB, MULT, DIV, REM
 }
+
+/*-----IR-----*/
 
 ir_var_t :: struct {name: u32, ver: u32};
 
@@ -682,6 +687,25 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
     typename: identifier_t;
 
     current := parser.tokens[parser.position]
+    
+    if consume_token(parser, simple_token_t.LEFT_CURLY){
+        list := make([dynamic]stmt_t);
+        s: stmt_t = parse_stmt(parser)
+        for {
+            if s == nil{
+                if consume_token(parser, simple_token_t.RIGHT_CURLY){
+                    break;
+                }else{
+                    panic("malformed block statement")
+                }
+            }else{
+                append(&list, s)
+                s= parse_stmt(parser)
+            }
+        }
+
+        return block_t{list[:len(list)]};
+    }
 
     #partial switch token in current {
         case identifier_t: {
@@ -738,7 +762,7 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
 
     expr := parse_expr(parser)
     if  expr != nil && consume_token(parser, simple_token_t.SEMI_COLON){
-        return exprstmt_t {expr}
+        return exprstmt_t {boxed_node(parser, expr)}
     }
     
     return nil
@@ -982,24 +1006,14 @@ parse_prim :: proc(parser: ^parser_t) -> expr_t{
                     }
                 }
                 
-                if consume_token(parser, simple_token_t.LEFT_CURLY){
-                    s: stmt_t = parse_stmt(parser)
-                    for {
-                        if s == nil{
-                            if consume_token(parser, simple_token_t.RIGHT_CURLY){
-                                break;
-                            }else{
-                                panic("malformed function declaration")
-                            }
-                            
-                        }else{
-                            append(&body, s)
-                            s= parse_stmt(parser)
-                        }
+                if peek_token(parser, simple_token_t.LEFT_CURLY, 0){
+                    s := parse_stmt(parser)
+                    if s == nil{
+                        panic("expected block stmt")
                     }
 
                     return func_info_t{
-                        prototype, body[:]
+                        prototype, s.(block_t)
                     }
                 }else{
                     return prototype;
@@ -1057,28 +1071,44 @@ parse_prim :: proc(parser: ^parser_t) -> expr_t{
 naive_ir :: proc(stmt: stmt_t) -> []ir_instruction_t {
     instructions := make_dynamic_array([dynamic]ir_instruction_t);
 
+    var_counter : u32 = 0; 
+    label_counter: u32 = 0;
+    nodes: =make([dynamic]ir_value_t)
+    
+    state := ir_state_t{
+        label_counter=&label_counter,
+        var_counter=&var_counter,
+        nodes=&nodes
+    }
 
-    transform_stmt(stmt, &instructions)
+    transform_stmt(stmt, state, &instructions)
     
 
     return instructions[:len(instructions)];
 }
 
-transform_stmt :: proc(stmt: stmt_t, ir_buf: ^[dynamic]ir_instruction_t) {
+transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_instruction_t) {
+    
     #partial switch type in stmt{
         case return_t: {
-            var_counter : u32 = 0; 
-            label_counter: u32 = 0;
-            nodes: =make([dynamic]ir_value_t)
-            state := ir_state_t{
-                label_counter=&label_counter,
-                var_counter=&var_counter,
-                nodes=&nodes
-            }
+            
             val := transform_expr(stmt.(return_t).inner, state, ir_buf)
             append(ir_buf, ir_emit_t {value=val })
         }
-        case: panic("unimplemented!")
+        case block_t:{
+            for s in stmt.(block_t).list{
+                transform_stmt(s, state, ir_buf)
+            }
+        }
+        case nil:
+            panic("attempt to transform nil stmt!")
+        case cdecl_t:
+            panic("cdecls are disallowed for now")
+        case exprstmt_t:
+            transform_expr(stmt.(exprstmt_t).inner, state, ir_buf)
+        case:
+            panic("unimplemented!")
+
     }
 }
 
@@ -1173,7 +1203,11 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
             append(ir_buf, comb)
 
             return res_var
-        case: panic("unimplemented!")
+        case func_info_t:
+            panic("functions unimplemented for now")
+        case: 
+            fmt.println(expr)
+            panic("unimplemented! ")
     }
 }
 
@@ -1189,7 +1223,7 @@ format_value :: proc(sbuilder: ^strings.Builder, val: ir_value_t){
             fmt.sbprintf(sbuilder, "CONST(%d)", val.(int_literal_t))
         }
         case ir_phony_t:
-            fmt.sbprint(sbuilder, "phi(")
+            fmt.sbprint(sbuilder, "phony(")
             list := val.(ir_phony_t).src
             for i in 0..<len(list){
                 format_value(sbuilder, list[i])
