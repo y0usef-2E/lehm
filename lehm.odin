@@ -95,8 +95,11 @@ lexer_t :: struct{
     len: uint 
 }
 
-main :: proc(){
+main :: proc(){    
     using binop_t
+
+    fmt.printfln("sizeof(parser_t): %d bytes", size_of(parser_t))
+    fmt.printfln("sizeof(scope_node_t): %d bytes", size_of(scope_t))
 
     test := "0b1111_1111"
     assert(parse_binary_literal(transmute([]u8)test) == 255)
@@ -113,19 +116,25 @@ main :: proc(){
     tokens := tokenize(bytes[:])
     
     nodes := make([]expr_t, 4096)
+    tracker := [0xFF]uint{};
 
     parser:= parser_t{
-        tokens=tokens[:], position=0, nodes=nodes, next_node=0, ptable=[32]u8{}
+        tokens=tokens[:], position=0, nodes=nodes, next_node=0, ptable=[32]u8{},
+        scope=0, global_symbols=make(map[identifier_t]expr_t), 
+        locals_stack=new([4096]vdecl_t)[:], next_local=0, scope_tracker=tracker[:]
     }
+
     init_precedence(&parser) 
     
     assert(parser.ptable[binop_t.MULT] == 50)
 
     stmt : stmt_t;
     for stmt := parse_stmt(&parser); stmt != nil; stmt = parse_stmt(&parser){
+        
         buf := naive_ir(stmt)
         str := format_ir_buffer(buf)
         fmt.println(str)
+        
     }
 
     assert(consume_token(&parser, simple_token_t.EOF))
@@ -503,12 +512,30 @@ tokenize :: proc(buf: []u8) -> [dynamic]token_t {
     return tokens
 }
 
+global_t :: struct{}
+
+scope_t :: struct{
+    self: u16,
+    next: ^scope_t
+}
+
 parser_t :: struct {
     tokens: []token_t,
     position: uint,
+
     nodes: []expr_t,
     next_node: uint,
-    ptable: [32]u8
+    
+    ptable: [32]u8,
+
+    scope: u16,
+    global_symbols: map[identifier_t]expr_t,
+    locals_stack: []vdecl_t,
+    locals_tracker: map[identifier_t]^scope_t,
+    next_local: uint,
+    scope_tracker: []uint,
+
+    in_proc: bool
 }
 
 consume_token :: proc(parser: ^parser_t, t: token_t) -> bool{
@@ -530,7 +557,7 @@ consume_identifier :: proc(parser: ^parser_t, ident: ^identifier_t) -> bool{
         case identifier_t:
             parser.position+=1
             ident^ = token
-            return true 
+            return true
         case: 
             return false
     }
@@ -561,12 +588,15 @@ expr_t :: union {
     struct_info_t,
     func_info_t,
     proto_t,
-    enum_info_t
+    enum_info_t,
+    local_t
 }
 
+local_t :: distinct uint
+
 assign_t :: struct{
-    varname: identifier_t,
-    lexpr: ^expr_t
+    varname: ^expr_t,
+    rhs: ^expr_t
 }
 
 struct_info_t :: struct{
@@ -600,12 +630,12 @@ block_t :: struct{
 
 cdecl_t :: struct{
     name: identifier_t,
-    value: expr_t
+    expr: expr_t
 }
 
 vdecl_t :: struct{
     name: identifier_t,
-    value: expr_t
+    expr: ^expr_t
 }
 
 return_t :: struct{
@@ -646,40 +676,49 @@ binop_t :: enum{
     ADD, SUB, MULT, DIV, REM
 }
 
-/*-----IR-----*/
+note_scope :: proc(parser: ^parser_t, ident: identifier_t){
+    s := new_clone(scope_t{
+        self = parser.scope, 
+        next = nil
+    })
+    
+    if parser.locals_tracker[ident] != nil {
+        h := parser.locals_tracker[ident]
+        s.next = h 
+    }
 
-ir_var_t :: struct {name: u32, ver: u32};
+    parser.locals_tracker[ident] = s
+} 
 
-ir_value_t :: union{ir_var_t, int_literal_t, ir_phony_t}
+scope_mhave_ident :: proc(parser: ^parser_t, scope: u16, ident: identifier_t) -> bool{
+    for e :=  parser.locals_tracker[ident]; e!= nil ; e=e.next{
+        if e.self == scope{
+            return true
+        }
+    }
 
-ir_binary_t :: struct {op: binop_t, left: ir_value_t, right: ir_value_t, dest: ir_var_t}
-
-ir_unary_t :: struct{op: unop_t, src: ir_value_t, dest: ir_var_t}
-
-ir_emit_t :: struct{value: ir_value_t}
-
-ir_label_t :: struct{id: u32, name: string}
-
-ir_jump_label_t :: struct{to: ir_label_t}
-
-ir_jz_label_t :: struct{test: ir_value_t, to: ir_label_t}
-
-ir_emit_label_t :: struct{is: ir_label_t}
-
-ir_copy_t :: struct{src: ir_value_t, dest: ir_value_t}
-
-ir_instruction_t :: union{
-    ir_unary_t,
-    ir_binary_t,
-    ir_emit_t,
-    ir_jump_label_t,
-    ir_jz_label_t, 
-    ir_emit_label_t,
-    ir_copy_t
+    return false
 }
 
-ir_phony_t :: struct{
-    src: []ir_value_t,
+local_var :: proc(parser: ^parser_t, var: vdecl_t) -> vdecl_t {
+    parser.locals_stack[parser.next_local]=var
+    // fmt.println("here declaring var ", var)
+
+    parser.next_local+=1
+    
+    note_scope(parser, var.name)
+    
+    return var
+}
+
+begin_scope :: proc(parser: ^parser_t){
+    parser.scope+=1
+    parser.scope_tracker[parser.scope] = parser.next_local
+}
+
+end_scope :: proc(parser: ^parser_t){
+    parser.next_local = parser.scope_tracker[parser.scope]
+    parser.scope-=1
 }
 
 parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
@@ -688,7 +727,15 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
 
     current := parser.tokens[parser.position]
     
-    if consume_token(parser, simple_token_t.LEFT_CURLY){
+    if peek_token(parser, simple_token_t.LEFT_CURLY, 0){
+        if !parser.in_proc{
+            panic("block statements disallowed outside procedures")
+        }
+        advance(parser)
+
+        begin_scope(parser)
+        defer end_scope(parser)
+
         list := make([dynamic]stmt_t);
         s: stmt_t = parse_stmt(parser)
         for {
@@ -714,41 +761,46 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                 parser.position+=2;
                 if consume_token(parser, simple_token_t.COLON){
                     // ConstDecl
-                    value := parse_expr(parser)
+                    value := parse_resolve_expr(parser)
                     
                     if !consume_token(parser, simple_token_t.SEMI_COLON){
                         panic("malformed const declaration")
                     }
+                    
+                    map_insert(&parser.global_symbols, varname, value)
 
                     return cdecl_t{
                         varname, value
                     }
-                }else if consume_token(parser, simple_token_t.EQ){
+                }
+                
+                if consume_identifier(parser, &typename){}
+                
+                if consume_token(parser, simple_token_t.EQ){
                     // VarDecl
-                    value := parse_expr(parser)
+
+                    if !parser.in_proc {
+                        panic("variable declarations disallowed outside procedures")
+                    }
+                    assert(parser.scope > 0)
+
+                    rhs := parse_resolve_expr(parser)
                     
                     if !consume_token(parser, simple_token_t.SEMI_COLON){
                         panic("malformed var declaration")
                     }
-                    
-                    return vdecl_t{
-                        name=varname, value=value
-                    }
-
-                }else if consume_identifier(parser, &typename){
-                    if consume_token(parser, simple_token_t.EQ){
-                        // VarDecl
-                    }
-                }
-
                 
+                    return local_var(parser, vdecl_t{
+                        name=varname, expr=boxed_node(parser, rhs)
+                    })
+                }
             }
         }
 
         case builtin_t:{
             if current==builtin_t.RETURN{
                 advance(parser)
-                inner :=boxed_node(parser, parse_expr(parser))
+                inner :=boxed_node(parser, parse_resolve_expr(parser))
                 if consume_token(parser, simple_token_t.SEMI_COLON){
                     return return_t{
                         inner
@@ -760,7 +812,7 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
         }
     }
 
-    expr := parse_expr(parser)
+    expr := parse_resolve_expr(parser)
     if  expr != nil && consume_token(parser, simple_token_t.SEMI_COLON){
         return exprstmt_t {boxed_node(parser, expr)}
     }
@@ -777,39 +829,118 @@ boxed_node :: proc(parser: ^parser_t, node: expr_t) -> ^expr_t{
     return &parser.nodes[at]
 }
 
-parse_expr :: proc(parser: ^parser_t) -> expr_t{
-    some_ident: identifier_t;
-    if peek_identifier(parser, &some_ident){
-        if peek_token(parser, simple_token_t.EQ, 1){
-            parser.position+=2;
-            lexpr := boxed_node(parser, parse_expr(parser))
-            if !consume_token(parser, simple_token_t.SEMI_COLON){
-                panic("malformed assignment")
-            }
-            return assign_t{
-                some_ident, lexpr
+resolve_expr :: proc(parser: ^parser_t, expr: ^expr_t) -> ^expr_t  {
+    switch kind in expr{
+        case identifier_t:{
+            ident := expr.(identifier_t)
+            rightmost := parser.next_local-1
+            for scope := parser.scope; scope>0; scope-=1{
+                leftmost := parser.scope_tracker[scope]
+                
+                // fmt.printfln("scope=%d, leftmost=%d, rightmost=%d, ident=%s", scope, leftmost,  rightmost, ident)
+                
+                if scope_mhave_ident(parser, scope, ident){
+                    // search all
+                    for j := rightmost; j>=leftmost; j-=1{
+                        vdecl := parser.locals_stack[j]
+                        
+                        if vdecl.name == ident{
+                            // fmt.println("resolved ", vdecl)
+
+                            ref := local_t(j)
+                            return boxed_node(parser, ref)
+                        }
+                    }
+                }
+
+                rightmost=leftmost-1
             }
         }
-    }
+            
+        case ifexpr_t:
+            _if := expr.(ifexpr_t)
+            _if.cond = resolve_expr(parser, _if.cond)
+            _if.then = resolve_expr(parser, _if.then)
+            _if.otherwise  = resolve_expr(parser, _if.otherwise)
+            expr^ = _if
+            return expr
 
-    logexpr := parse_logexpr(parser, DEF_MINPREC);
-    if consume_token(parser, builtin_t.IF){
-        cond := parse_expr(parser)
-        if cond == nil {panic("malformed if-expression")}
-        if consume_token(parser, simple_token_t.COMMA){   
-            otherwise := parse_expr(parser)
-            return ifexpr_t{
-                then=boxed_node(parser, logexpr),
-                cond=boxed_node(parser, cond),
-                otherwise=boxed_node(parser, otherwise)
+        case assign_t:
+            _a := expr.(assign_t)
+            _a.rhs = resolve_expr(parser, _a.rhs)
+            _a.varname = resolve_expr(parser, _a.varname)
+            
+            expr^ = _a 
+            return expr
+
+        case binexpr_t:
+            _b := expr.(binexpr_t)
+            _b.left = resolve_expr(parser, _b.left)
+            _b.right = resolve_expr(parser, _b.right)
+            expr^ = _b 
+            return expr 
+
+        case unexpr_t:
+            _u := expr.(unexpr_t)
+            _u.inner = resolve_expr(parser, _u.inner)
+            expr^ = _u 
+            return expr
+
+        case int_literal_t, char_literal_t, float_literal_t, string_literal_t:
+            return expr
+
+        case struct_info_t, func_info_t, enum_info_t, proto_t:
+            fmt.eprintln("[warning] name resolution not implemented for this variant") 
+            return expr
+
+        case local_t:
+            panic("attempting to resolve an already resolved expression")
+        
+    }
+    return nil
+}
+
+parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
+    
+    __parse_expr :: proc(parser: ^parser_t) -> expr_t{
+            some_ident: identifier_t;
+            if peek_identifier(parser, &some_ident){
+                if peek_token(parser, simple_token_t.EQ, 1){
+                    parser.position+=2;
+                    rhs := boxed_node(parser, parse_resolve_expr(parser))
+                    if !consume_token(parser, simple_token_t.SEMI_COLON){
+                        panic("malformed assignment")
+                    }
+                    assign_to := boxed_node(parser, some_ident)
+                    return assign_t{
+                        assign_to, rhs
+                    }
+                }
             }
-        }
-        panic("malformed if-expression")
-    }
-    
 
+            logexpr := parse_logexpr(parser, DEF_MINPREC);
+            if consume_token(parser, builtin_t.IF){
+                cond := parse_resolve_expr(parser)
+                if cond == nil {panic("malformed if-expression")}
+                if consume_token(parser, simple_token_t.COMMA){   
+                    otherwise := parse_resolve_expr(parser)
+                    return ifexpr_t{
+                        then=boxed_node(parser, logexpr),
+                        cond=boxed_node(parser, cond),
+                        otherwise=boxed_node(parser, otherwise)
+                    }
+                }
+                panic("malformed if-expression")
+            }
+            
+            return logexpr
+    }
+
+    expr := __parse_expr(parser)
     
-    return logexpr
+    success := resolve_expr(parser, &expr)
+
+    return expr
 }
 
 peek_connective :: proc(parser:^parser_t) -> binop_t {
@@ -962,7 +1093,7 @@ parse_prim :: proc(parser: ^parser_t) -> expr_t{
         case builtin_t.ENUM:
             panic("unimplemented!")
         
-        case builtin_t.FN:
+        case builtin_t.FN:{
             advance(parser)
             args : map[identifier_t]identifier_t;
             if consume_token(parser, simple_token_t.LEFT_PAREN){
@@ -1007,6 +1138,8 @@ parse_prim :: proc(parser: ^parser_t) -> expr_t{
                 }
                 
                 if peek_token(parser, simple_token_t.LEFT_CURLY, 0){
+                    parser.in_proc = true
+                    defer parser.in_proc = false
                     s := parse_stmt(parser)
                     if s == nil{
                         panic("expected block stmt")
@@ -1019,6 +1152,7 @@ parse_prim :: proc(parser: ^parser_t) -> expr_t{
                     return prototype;
                 }
             }
+        }
             
         case builtin_t.STRUCT:{
             advance(parser)
@@ -1056,7 +1190,7 @@ parse_prim :: proc(parser: ^parser_t) -> expr_t{
         }
     }
     if consume_token(parser, simple_token_t.LEFT_PAREN){
-        inner := parse_expr(parser)
+        inner := parse_resolve_expr(parser)
         if consume_token(parser, simple_token_t.RIGHT_PAREN){
             if inner == nil{
                 panic("malformed expression (paren)")
@@ -1066,6 +1200,42 @@ parse_prim :: proc(parser: ^parser_t) -> expr_t{
     }
 
     return nil
+}
+
+/*-----IR-----*/
+
+ir_var_t :: struct {name: u32, ver: u32};
+
+ir_value_t :: union{ir_var_t, int_literal_t, ir_phony_t}
+
+ir_binary_t :: struct {op: binop_t, left: ir_value_t, right: ir_value_t, dest: ir_var_t}
+
+ir_unary_t :: struct{op: unop_t, src: ir_value_t, dest: ir_var_t}
+
+ir_emit_t :: struct{value: ir_value_t}
+
+ir_label_t :: struct{id: u32, name: string}
+
+ir_jump_label_t :: struct{to: ir_label_t}
+
+ir_jz_label_t :: struct{test: ir_value_t, to: ir_label_t}
+
+ir_emit_label_t :: struct{is: ir_label_t}
+
+ir_copy_t :: struct{src: ir_value_t, dest: ir_value_t}
+
+ir_instruction_t :: union{
+    ir_unary_t,
+    ir_binary_t,
+    ir_emit_t,
+    ir_jump_label_t,
+    ir_jz_label_t, 
+    ir_emit_label_t,
+    ir_copy_t
+}
+
+ir_phony_t :: struct{
+    src: []ir_value_t,
 }
 
 naive_ir :: proc(stmt: stmt_t) -> []ir_instruction_t {
@@ -1102,8 +1272,11 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
         }
         case nil:
             panic("attempt to transform nil stmt!")
+
         case cdecl_t:
-            panic("cdecls are disallowed for now")
+            // skip
+            return
+        
         case exprstmt_t:
             transform_expr(stmt.(exprstmt_t).inner, state, ir_buf)
         case:
