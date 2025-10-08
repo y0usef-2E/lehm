@@ -120,8 +120,9 @@ main :: proc(){
 
     parser:= parser_t{
         tokens=tokens[:], position=0, nodes=nodes, next_node=0, ptable=[32]u8{},
-        scope=0, global_symbols=make(map[identifier_t]expr_t), 
-        locals_stack=new([4096]vdecl_t)[:], next_local=0, scope_tracker=tracker[:]
+        scope=0, global_symbols=make(map[identifier_t]^expr_t), 
+        locals_stack=new([4096]vdecl_t)[:], next_local=0, scope_ptrs=tracker[:], 
+        in_proc=false, scope_ident_tracker=map[identifier_t]^scope_t{}, maybe_globals=make([dynamic]identifier_t)
     }
 
     init_precedence(&parser) 
@@ -129,8 +130,25 @@ main :: proc(){
     assert(parser.ptable[binop_t.MULT] == 50)
 
     stmt : stmt_t;
-    for stmt := parse_stmt(&parser); stmt != nil; stmt = parse_stmt(&parser){
-        
+
+    all_stmts := make([dynamic]stmt_t)
+
+    for stmt := parse_stmt(&parser); stmt!=nil ; stmt=parse_stmt(&parser){
+        append(&all_stmts, stmt)
+    }
+
+    for var in parser.maybe_globals{
+        ref := parser.global_symbols[var]
+        if ref == nil{
+            fmt.eprintln("undeclared symbol ", var)
+            panic("")
+        }else{
+            fmt.eprintln("symbol is ", ref^)
+            panic("")
+        }
+    }
+
+    for stmt in all_stmts{
         buf := naive_ir(stmt)
         str := format_ir_buffer(buf)
         fmt.println(str)
@@ -512,8 +530,6 @@ tokenize :: proc(buf: []u8) -> [dynamic]token_t {
     return tokens
 }
 
-global_t :: struct{}
-
 scope_t :: struct{
     self: u16,
     next: ^scope_t
@@ -529,11 +545,12 @@ parser_t :: struct {
     ptable: [32]u8,
 
     scope: u16,
-    global_symbols: map[identifier_t]expr_t,
+    global_symbols: map[identifier_t]^expr_t,
     locals_stack: []vdecl_t,
-    locals_tracker: map[identifier_t]^scope_t,
+    scope_ident_tracker: map[identifier_t]^scope_t,
     next_local: uint,
-    scope_tracker: []uint,
+    scope_ptrs: []uint,
+    maybe_globals: [dynamic]identifier_t,
 
     in_proc: bool
 }
@@ -589,10 +606,17 @@ expr_t :: union {
     func_info_t,
     proto_t,
     enum_info_t,
-    local_t
+    local_t,
 }
 
 local_t :: distinct uint
+
+const_kind_t :: enum{
+    PROC, 
+    STRUCT,
+}
+
+global_t :: distinct ^expr_t
 
 assign_t :: struct{
     varname: ^expr_t,
@@ -630,7 +654,7 @@ block_t :: struct{
 
 cdecl_t :: struct{
     name: identifier_t,
-    expr: expr_t
+    expr: ^expr_t
 }
 
 vdecl_t :: struct{
@@ -682,16 +706,16 @@ note_scope :: proc(parser: ^parser_t, ident: identifier_t){
         next = nil
     })
     
-    if parser.locals_tracker[ident] != nil {
-        h := parser.locals_tracker[ident]
+    if parser.scope_ident_tracker[ident] != nil {
+        h := parser.scope_ident_tracker[ident]
         s.next = h 
     }
 
-    parser.locals_tracker[ident] = s
+    parser.scope_ident_tracker[ident] = s
 } 
 
 scope_mhave_ident :: proc(parser: ^parser_t, scope: u16, ident: identifier_t) -> bool{
-    for e :=  parser.locals_tracker[ident]; e!= nil ; e=e.next{
+    for e :=  parser.scope_ident_tracker[ident]; e!= nil ; e=e.next{
         if e.self == scope{
             return true
         }
@@ -713,11 +737,11 @@ local_var :: proc(parser: ^parser_t, var: vdecl_t) -> vdecl_t {
 
 begin_scope :: proc(parser: ^parser_t){
     parser.scope+=1
-    parser.scope_tracker[parser.scope] = parser.next_local
+    parser.scope_ptrs[parser.scope] = parser.next_local
 }
 
 end_scope :: proc(parser: ^parser_t){
-    parser.next_local = parser.scope_tracker[parser.scope]
+    parser.next_local = parser.scope_ptrs[parser.scope]
     parser.scope-=1
 }
 
@@ -763,14 +787,18 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                     // ConstDecl
                     value := parse_resolve_expr(parser)
                     
+                    // assert value is const
+                    
+                    value_ref := boxed_node(parser, value)
+                    
                     if !consume_token(parser, simple_token_t.SEMI_COLON){
                         panic("malformed const declaration")
                     }
                     
-                    map_insert(&parser.global_symbols, varname, value)
+                    map_insert(&parser.global_symbols, varname, value_ref)
 
                     return cdecl_t{
-                        varname, value
+                        varname, value_ref
                     }
                 }
                 
@@ -829,76 +857,11 @@ boxed_node :: proc(parser: ^parser_t, node: expr_t) -> ^expr_t{
     return &parser.nodes[at]
 }
 
-resolve_expr :: proc(parser: ^parser_t, expr: ^expr_t) -> ^expr_t  {
-    switch kind in expr{
-        case identifier_t:{
-            ident := expr.(identifier_t)
-            rightmost := parser.next_local-1
-            for scope := parser.scope; scope>0; scope-=1{
-                leftmost := parser.scope_tracker[scope]
-                
-                // fmt.printfln("scope=%d, leftmost=%d, rightmost=%d, ident=%s", scope, leftmost,  rightmost, ident)
-                
-                if scope_mhave_ident(parser, scope, ident){
-                    // search all
-                    for j := rightmost; j>=leftmost; j-=1{
-                        vdecl := parser.locals_stack[j]
-                        
-                        if vdecl.name == ident{
-                            // fmt.println("resolved ", vdecl)
+maybe_global :: proc(parser: ^parser_t, ident: identifier_t) {
 
-                            ref := local_t(j)
-                            return boxed_node(parser, ref)
-                        }
-                    }
-                }
-
-                rightmost=leftmost-1
-            }
-        }
-            
-        case ifexpr_t:
-            _if := expr.(ifexpr_t)
-            _if.cond = resolve_expr(parser, _if.cond)
-            _if.then = resolve_expr(parser, _if.then)
-            _if.otherwise  = resolve_expr(parser, _if.otherwise)
-            expr^ = _if
-            return expr
-
-        case assign_t:
-            _a := expr.(assign_t)
-            _a.rhs = resolve_expr(parser, _a.rhs)
-            _a.varname = resolve_expr(parser, _a.varname)
-            
-            expr^ = _a 
-            return expr
-
-        case binexpr_t:
-            _b := expr.(binexpr_t)
-            _b.left = resolve_expr(parser, _b.left)
-            _b.right = resolve_expr(parser, _b.right)
-            expr^ = _b 
-            return expr 
-
-        case unexpr_t:
-            _u := expr.(unexpr_t)
-            _u.inner = resolve_expr(parser, _u.inner)
-            expr^ = _u 
-            return expr
-
-        case int_literal_t, char_literal_t, float_literal_t, string_literal_t:
-            return expr
-
-        case struct_info_t, func_info_t, enum_info_t, proto_t:
-            fmt.eprintln("[warning] name resolution not implemented for this variant") 
-            return expr
-
-        case local_t:
-            panic("attempting to resolve an already resolved expression")
-        
-    }
-    return nil
 }
+
+
 
 parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
     
@@ -936,9 +899,83 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
             return logexpr
     }
 
+    __resolve_expr :: proc(parser: ^parser_t, expr: ^expr_t) -> ^expr_t  {
+        switch kind in expr{
+            case identifier_t:{
+                ident := expr.(identifier_t)
+                rightmost := parser.next_local-1
+                for scope := parser.scope; scope>0; scope-=1{
+                    leftmost := parser.scope_ptrs[scope]
+                    
+                    // fmt.printfln("scope=%d, leftmost=%d, rightmost=%d, ident=%s", scope, leftmost,  rightmost, ident)
+                    
+                    if scope_mhave_ident(parser, scope, ident){
+                        // search all
+                        for j := rightmost; j>=leftmost; j-=1{
+                            vdecl := parser.locals_stack[j]
+                            
+                            if vdecl.name == ident{
+                                // fmt.println("resolved ", vdecl)
+
+                                ref := local_t(j)
+                                return boxed_node(parser, ref)
+                            }
+                        }
+                    }
+
+                    rightmost=leftmost-1
+                }
+                
+                // identifier is not a local
+                append(&parser.maybe_globals, ident)
+            }
+
+            case ifexpr_t:
+                _if := expr.(ifexpr_t)
+                _if.cond = __resolve_expr(parser, _if.cond)
+                _if.then = __resolve_expr(parser, _if.then)
+                _if.otherwise  = __resolve_expr(parser, _if.otherwise)
+                expr^ = _if
+                return expr
+
+            case assign_t:
+                _a := expr.(assign_t)
+                _a.rhs = __resolve_expr(parser, _a.rhs)
+                _a.varname = __resolve_expr(parser, _a.varname)
+                
+                expr^ = _a 
+                return expr
+
+            case binexpr_t:
+                _b := expr.(binexpr_t)
+                _b.left = __resolve_expr(parser, _b.left)
+                _b.right = __resolve_expr(parser, _b.right)
+                expr^ = _b 
+                return expr 
+
+            case unexpr_t:
+                _u := expr.(unexpr_t)
+                _u.inner = __resolve_expr(parser, _u.inner)
+                expr^ = _u 
+                return expr
+
+            case int_literal_t, char_literal_t, float_literal_t, string_literal_t:
+                return expr
+
+            case struct_info_t, func_info_t, enum_info_t, proto_t:
+                fmt.eprintln("[warning] name resolution not implemented for this variant") 
+                return expr
+
+            case local_t:
+                panic("attempting to resolve an already resolved expression")
+            
+        }
+        return nil
+    }
+
     expr := __parse_expr(parser)
     
-    success := resolve_expr(parser, &expr)
+    success := __resolve_expr(parser, &expr)
 
     return expr
 }
