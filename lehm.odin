@@ -120,7 +120,7 @@ main :: proc(){
 
     parser:= parser_t{
         tokens=tokens[:], position=0, nodes=nodes, next_node=0, ptable=[32]u8{},
-        scope=0, global_symbols=make(map[identifier_t]^expr_t), 
+        scope=0, global_symbols=make(map[identifier_t]^cdecl_t), 
         locals_stack=new([4096]vdecl_t)[:], next_local=0, scope_ptrs=tracker[:], 
         in_proc=false, scope_ident_tracker=map[identifier_t]^scope_t{}, maybe_globals=make([dynamic]identifier_t)
     }
@@ -144,15 +144,17 @@ main :: proc(){
             panic("")
         }else{
             fmt.eprintln("symbol is ", ref^)
-            panic("")
         }
+    }
+
+    for glob in parser.global_symbols{
+
     }
 
     for stmt in all_stmts{
         buf := naive_ir(stmt)
         str := format_ir_buffer(buf)
         fmt.println(str)
-        
     }
 
     assert(consume_token(&parser, simple_token_t.EOF))
@@ -545,7 +547,7 @@ parser_t :: struct {
     ptable: [32]u8,
 
     scope: u16,
-    global_symbols: map[identifier_t]^expr_t,
+    global_symbols: map[identifier_t]^cdecl_t,
     locals_stack: []vdecl_t,
     scope_ident_tracker: map[identifier_t]^scope_t,
     next_local: uint,
@@ -609,14 +611,12 @@ expr_t :: union {
     local_t,
 }
 
-local_t :: distinct uint
+local_t :: distinct ^vdecl_t
 
 const_kind_t :: enum{
     PROC, 
     STRUCT,
 }
-
-global_t :: distinct ^expr_t
 
 assign_t :: struct{
     varname: ^expr_t,
@@ -795,11 +795,14 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                         panic("malformed const declaration")
                     }
                     
-                    map_insert(&parser.global_symbols, varname, value_ref)
-
-                    return cdecl_t{
+                    decl := cdecl_t{
                         varname, value_ref
                     }
+                    
+                    // allocating for now
+                    map_insert(&parser.global_symbols, varname, new_clone(decl))
+
+                    return decl
                 }
                 
                 if consume_identifier(parser, &typename){}
@@ -915,10 +918,10 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
                             vdecl := parser.locals_stack[j]
                             
                             if vdecl.name == ident{
-                                // fmt.println("resolved ", vdecl)
+                                fmt.println("resolved ", vdecl.name, vdecl.expr^)
 
-                                ref := local_t(j)
-                                return boxed_node(parser, ref)
+                                expr^=local_t(&parser.locals_stack[j])
+                                return expr
                             }
                         }
                     }
@@ -928,6 +931,7 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
                 
                 // identifier is not a local
                 append(&parser.maybe_globals, ident)
+                return expr
             }
 
             case ifexpr_t:
@@ -1331,6 +1335,22 @@ ir_state_t :: struct{
     var_counter: ^u32, 
     label_counter: ^u32,
     nodes: ^[dynamic]ir_value_t,
+}
+
+
+ir_produce_global :: proc(expr: ^expr_t, state: ir_state_t, ir_buf: ^[dynamic]ir_instruction_t){
+    #partial switch type in expr{
+        case int_literal_t: {
+            k := expr.(int_literal_t)
+            dest := ir_var_t {state.var_counter^, 0}
+        
+            state.var_counter^+=1 
+
+            append(ir_buf, ir_copy_t{
+                dest, ir_value_t(k)
+            })
+        }
+    }
 }
 
 transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_instruction_t)-> ir_value_t {
