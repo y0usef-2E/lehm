@@ -121,7 +121,7 @@ main :: proc(){
     parser:= parser_t{
         tokens=tokens[:], position=0, nodes=nodes, next_node=0, ptable=[32]u8{},
         scope=0, global_symbols=make(map[identifier_t]^cdecl_t), 
-        locals_stack=new([4096]vdecl_t)[:], next_local=0, scope_ptrs=tracker[:], 
+        locals_stack=new([4096]variable_t)[:], next_local=0, scope_ptrs=tracker[:], 
         in_proc=false, scope_ident_tracker=map[identifier_t]^scope_t{}, maybe_globals=make([dynamic]identifier_t)
     }
 
@@ -129,35 +129,7 @@ main :: proc(){
     
     assert(parser.ptable[binop_t.MULT] == 50)
 
-    stmt : stmt_t;
-
-    all_stmts := make([dynamic]stmt_t)
-
-    for stmt := parse_stmt(&parser); stmt!=nil ; stmt=parse_stmt(&parser){
-        append(&all_stmts, stmt)
-    }
-
-    for var in parser.maybe_globals{
-        ref := parser.global_symbols[var]
-        if ref == nil{
-            fmt.eprintln("undeclared symbol ", var)
-            panic("")
-        }else{
-            fmt.eprintln("symbol is ", ref^)
-        }
-    }
-
-    for glob in parser.global_symbols{
-
-    }
-
-    for stmt in all_stmts{
-        buf := naive_ir(stmt)
-        str := format_ir_buffer(buf)
-        fmt.println(str)
-    }
-
-    assert(consume_token(&parser, simple_token_t.EOF))
+    naive_ir(&parser)
 }
 
 init_precedence :: proc(parser: ^parser_t){
@@ -548,7 +520,7 @@ parser_t :: struct {
 
     scope: u16,
     global_symbols: map[identifier_t]^cdecl_t,
-    locals_stack: []vdecl_t,
+    locals_stack: []variable_t,
     scope_ident_tracker: map[identifier_t]^scope_t,
     next_local: uint,
     scope_ptrs: []uint,
@@ -611,8 +583,6 @@ expr_t :: union {
     local_t,
 }
 
-local_t :: distinct ^vdecl_t
-
 const_kind_t :: enum{
     PROC, 
     STRUCT,
@@ -642,7 +612,7 @@ enum_info_t :: struct{}
 
 stmt_t :: union {
     cdecl_t,
-    vdecl_t,
+    vdecl_stmt_t,
     return_t,
     exprstmt_t,
     block_t
@@ -657,9 +627,15 @@ cdecl_t :: struct{
     expr: ^expr_t
 }
 
-vdecl_t :: struct{
+variable_t :: struct{
     name: identifier_t,
     expr: ^expr_t
+}
+
+local_t :: distinct ^variable_t
+
+vdecl_stmt_t :: struct{
+    is: local_t
 }
 
 return_t :: struct{
@@ -724,15 +700,15 @@ scope_mhave_ident :: proc(parser: ^parser_t, scope: u16, ident: identifier_t) ->
     return false
 }
 
-local_var :: proc(parser: ^parser_t, var: vdecl_t) -> vdecl_t {
+local_var :: proc(parser: ^parser_t, var: variable_t) -> vdecl_stmt_t {
     parser.locals_stack[parser.next_local]=var
     // fmt.println("here declaring var ", var)
 
     parser.next_local+=1
     
     note_scope(parser, var.name)
-    
-    return var
+    at := local_t(&parser.locals_stack[parser.next_local-1])
+    return vdecl_stmt_t{is = at}
 }
 
 begin_scope :: proc(parser: ^parser_t){
@@ -820,8 +796,8 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                     if !consume_token(parser, simple_token_t.SEMI_COLON){
                         panic("malformed var declaration")
                     }
-                
-                    return local_var(parser, vdecl_t{
+                    
+                    return local_var(parser, variable_t{
                         name=varname, expr=boxed_node(parser, rhs)
                     })
                 }
@@ -918,10 +894,12 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
                             vdecl := parser.locals_stack[j]
                             
                             if vdecl.name == ident{
-                                fmt.println("resolved ", vdecl.name, vdecl.expr^)
-
-                                expr^=local_t(&parser.locals_stack[j])
-                                return expr
+                                 // fmt.println("resolving: ", ident)
+                                expr^= local_t(&parser.locals_stack[j])
+                                 // fmt.println("is: ", expr^)
+                                recur := __resolve_expr(parser, expr)
+                                 // fmt.println("is actually: ", recur^)
+                                return recur
                             }
                         }
                     }
@@ -971,7 +949,13 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
                 return expr
 
             case local_t:
-                panic("attempting to resolve an already resolved expression")
+                var := expr.(local_t)
+                #partial switch type in var.expr {
+                    case local_t:
+                        return __resolve_expr(parser, var.expr)
+                    case:
+                        return expr
+                }
             
         }
         return nil
@@ -1279,8 +1263,30 @@ ir_phony_t :: struct{
     src: []ir_value_t,
 }
 
-naive_ir :: proc(stmt: stmt_t) -> []ir_instruction_t {
-    instructions := make_dynamic_array([dynamic]ir_instruction_t);
+naive_ir :: proc(parser: ^parser_t) -> []ir_instruction_t {
+    stmt : stmt_t;
+
+    all_stmts := make([dynamic]stmt_t)
+
+    for stmt := parse_stmt(parser); stmt!=nil ; stmt=parse_stmt(parser){
+        append(&all_stmts, stmt)
+    }
+
+    for var in parser.maybe_globals{
+        ref := parser.global_symbols[var]
+        if ref == nil{
+            fmt.eprintln("undeclared symbol ", var)
+            panic("")
+        }else{
+            fmt.eprintln("symbol is ", ref^)
+        }
+    }
+
+    for glob in parser.global_symbols{
+
+    }
+
+    ir_buf := make_dynamic_array([dynamic]ir_instruction_t);
 
     var_counter : u32 = 0; 
     label_counter: u32 = 0;
@@ -1289,37 +1295,63 @@ naive_ir :: proc(stmt: stmt_t) -> []ir_instruction_t {
     state := ir_state_t{
         label_counter=&label_counter,
         var_counter=&var_counter,
-        nodes=&nodes
+        nodes=&nodes,
+        locals_stack=parser.locals_stack,
+        locals=new(map[local_t]ir_var_t)
     }
 
-    transform_stmt(stmt, state, &instructions)
-    
+    for stmt in all_stmts{
+        transform_stmt(stmt, state, &ir_buf)
+    }
 
-    return instructions[:len(instructions)];
+    str := format_ir_buffer(ir_buf[:])
+
+    fmt.println(str)
+    
+    return ir_buf[:len(ir_buf)];
 }
 
 transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_instruction_t) {
-    
     #partial switch type in stmt{
         case return_t: {
-            
             val := transform_expr(stmt.(return_t).inner, state, ir_buf)
             append(ir_buf, ir_emit_t {value=val })
         }
+
         case block_t:{
             for s in stmt.(block_t).list{
                 transform_stmt(s, state, ir_buf)
             }
         }
+
+        case vdecl_stmt_t:
+            var := stmt.(vdecl_stmt_t).is 
+            
+            src := transform_expr(var.expr, state, ir_buf)
+
+            dest := ir_var_t{name=state.var_counter^, ver=0 }
+            state.var_counter^+=1
+            
+            append(ir_buf, ir_copy_t{src, dest})
+            
+            map_insert(state.locals, var, dest)
+            
+        case cdecl_t:
+            expr := stmt.(cdecl_t).expr
+            #partial switch type in expr {
+                case func_info_t:
+                    transform_stmt(expr.(func_info_t).body, state, ir_buf)
+                case:
+                    transform_expr(expr, state, ir_buf)
+            }
+            
+        
         case nil:
             panic("attempt to transform nil stmt!")
 
-        case cdecl_t:
-            // skip
-            return
-        
         case exprstmt_t:
             transform_expr(stmt.(exprstmt_t).inner, state, ir_buf)
+
         case:
             panic("unimplemented!")
 
@@ -1335,6 +1367,8 @@ ir_state_t :: struct{
     var_counter: ^u32, 
     label_counter: ^u32,
     nodes: ^[dynamic]ir_value_t,
+    locals_stack: []variable_t,
+    locals: ^map[local_t]ir_var_t
 }
 
 
@@ -1381,7 +1415,6 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
         }
 
         case ifexpr_t:
-            
             this := expr.(ifexpr_t)
             
             res_var: ir_var_t ={ var_counter^, 0}
@@ -1433,10 +1466,15 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
             append(ir_buf, comb)
 
             return res_var
+
+        case local_t:
+
+            return state.locals[expr.(local_t)]
         case func_info_t:
-            panic("functions unimplemented for now")
+            panic("unreachable: functions should not be handled as expressions in ir")
+            
         case: 
-            fmt.println(expr)
+            fmt.println("transforming: ", expr^)
             panic("unimplemented! ")
     }
 }
