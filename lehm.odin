@@ -99,7 +99,7 @@ main :: proc(){
     using binop_t
 
     fmt.printfln("sizeof(parser_t): %d bytes", size_of(parser_t))
-    fmt.printfln("sizeof(scope_node_t): %d bytes", size_of(scope_t))
+    // fmt.printfln("sizeof(scope_node_t): %d bytes", size_of(scope_t))
 
     test := "0b1111_1111"
     assert(parse_binary_literal(transmute([]u8)test) == 255)
@@ -121,7 +121,7 @@ main :: proc(){
     parser:= parser_t{
         tokens=tokens[:], position=0, nodes=nodes, next_node=0, ptable=[32]u8{},
         scope=0, global_symbols=make(map[identifier_t]^cdecl_t), 
-        locals_stack=new([4096]variable_t)[:], next_local=0, scope_ptrs=tracker[:], 
+        locals_stack=new([4096]local_t)[:], next_local=0, scope_ptrs=tracker[:], 
         in_proc=false, scope_ident_tracker=map[identifier_t]^scope_t{}, maybe_globals=make([dynamic]identifier_t)
     }
 
@@ -520,7 +520,7 @@ parser_t :: struct {
 
     scope: u16,
     global_symbols: map[identifier_t]^cdecl_t,
-    locals_stack: []variable_t,
+    locals_stack: []local_t,
     scope_ident_tracker: map[identifier_t]^scope_t,
     next_local: uint,
     scope_ptrs: []uint,
@@ -580,7 +580,7 @@ expr_t :: union {
     func_info_t,
     proto_t,
     enum_info_t,
-    local_t,
+    ref_local_t,
 }
 
 const_kind_t :: enum{
@@ -624,18 +624,19 @@ block_t :: struct{
 
 cdecl_t :: struct{
     name: identifier_t,
-    expr: ^expr_t
+    expr: expr_t
 }
 
-variable_t :: struct{
+local_t :: struct{
+    is_var: bool,
     name: identifier_t,
     expr: ^expr_t
 }
 
-local_t :: distinct ^variable_t
+ref_local_t :: ^local_t
 
 vdecl_stmt_t :: struct{
-    is: local_t
+    is: ref_local_t
 }
 
 return_t :: struct{
@@ -700,15 +701,14 @@ scope_mhave_ident :: proc(parser: ^parser_t, scope: u16, ident: identifier_t) ->
     return false
 }
 
-local_var :: proc(parser: ^parser_t, var: variable_t) -> vdecl_stmt_t {
+push_local :: proc(parser: ^parser_t, var: local_t)-> ref_local_t{
     parser.locals_stack[parser.next_local]=var
-    // fmt.println("here declaring var ", var)
 
     parser.next_local+=1
     
     note_scope(parser, var.name)
-    at := local_t(&parser.locals_stack[parser.next_local-1])
-    return vdecl_stmt_t{is = at}
+    at := ref_local_t(&parser.locals_stack[parser.next_local-1])
+    return at
 }
 
 begin_scope :: proc(parser: ^parser_t){
@@ -761,23 +761,26 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                 parser.position+=2;
                 if consume_token(parser, simple_token_t.COLON){
                     // ConstDecl
-                    value := parse_resolve_expr(parser)
-                    
                     // assert value is const
-                    
-                    value_ref := boxed_node(parser, value)
+                    rhs := parse_resolve_expr(parser)
                     
                     if !consume_token(parser, simple_token_t.SEMI_COLON){
                         panic("malformed const declaration")
                     }
                     
                     decl := cdecl_t{
-                        varname, value_ref
+                        varname, rhs
                     }
                     
-                    // allocating for now
-                    map_insert(&parser.global_symbols, varname, new_clone(decl))
-
+                    if parser.scope == 0{
+                        // allocating for now
+                        map_insert(&parser.global_symbols, varname, new_clone(decl))
+                    }else{
+                        ref := push_local(parser, local_t{
+                            is_var=false, name=varname, expr=boxed_node(parser, rhs)
+                        })
+                        decl.expr = ref
+                    }
                     return decl
                 }
                 
@@ -797,9 +800,11 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                         panic("malformed var declaration")
                     }
                     
-                    return local_var(parser, variable_t{
-                        name=varname, expr=boxed_node(parser, rhs)
+                    at := push_local(parser, local_t{
+                        is_var=true, name=varname, expr=boxed_node(parser, rhs)
                     })
+
+                    return vdecl_stmt_t{at}
                 }
             }
         }
@@ -835,12 +840,6 @@ boxed_node :: proc(parser: ^parser_t, node: expr_t) -> ^expr_t{
 
     return &parser.nodes[at]
 }
-
-maybe_global :: proc(parser: ^parser_t, ident: identifier_t) {
-
-}
-
-
 
 parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
     
@@ -891,14 +890,14 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
                     if scope_mhave_ident(parser, scope, ident){
                         // search all
                         for j := rightmost; j>=leftmost; j-=1{
-                            vdecl := parser.locals_stack[j]
+                            local := parser.locals_stack[j]
                             
-                            if vdecl.name == ident{
-                                 // fmt.println("resolving: ", ident)
-                                expr^= local_t(&parser.locals_stack[j])
-                                 // fmt.println("is: ", expr^)
+                            if local.name == ident{
+                                // fmt.println("resolving: ", ident)
+                                expr^= ref_local_t(&parser.locals_stack[j])
+                                // fmt.println("is: ", expr^)
                                 recur := __resolve_expr(parser, expr)
-                                 // fmt.println("is actually: ", recur^)
+                                // fmt.println("is actually: ", recur^)
                                 return recur
                             }
                         }
@@ -948,10 +947,10 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
                 fmt.eprintln("[warning] name resolution not implemented for this variant") 
                 return expr
 
-            case local_t:
-                var := expr.(local_t)
+            case ref_local_t:
+                var := expr.(ref_local_t)
                 #partial switch type in var.expr {
-                    case local_t:
+                    case ref_local_t:
                         return __resolve_expr(parser, var.expr)
                     case:
                         return expr
@@ -1282,10 +1281,6 @@ naive_ir :: proc(parser: ^parser_t) -> []ir_instruction_t {
         }
     }
 
-    for glob in parser.global_symbols{
-
-    }
-
     ir_buf := make_dynamic_array([dynamic]ir_instruction_t);
 
     var_counter : u32 = 0; 
@@ -1297,9 +1292,13 @@ naive_ir :: proc(parser: ^parser_t) -> []ir_instruction_t {
         var_counter=&var_counter,
         nodes=&nodes,
         locals_stack=parser.locals_stack,
-        locals=new(map[local_t]ir_var_t)
+        locals=new(map[ref_local_t]ir_var_t)
     }
+    
+    for glob in parser.global_symbols{
 
+    }
+    
     for stmt in all_stmts{
         transform_stmt(stmt, state, &ir_buf)
     }
@@ -1310,6 +1309,8 @@ naive_ir :: proc(parser: ^parser_t) -> []ir_instruction_t {
     
     return ir_buf[:len(ir_buf)];
 }
+
+transform_glob :: proc(glob: ^cdecl_t){}
 
 transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_instruction_t) {
     #partial switch type in stmt{
@@ -1341,10 +1342,22 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
             #partial switch type in expr {
                 case func_info_t:
                     transform_stmt(expr.(func_info_t).body, state, ir_buf)
+                
+                case ref_local_t: 
+                    local := expr.(ref_local_t)
+                    src := transform_expr(local.expr, state, ir_buf)
+
+                    dest := ir_var_t{name=state.var_counter^, ver=0 }
+                    state.var_counter^+=1
+                    
+                    append(ir_buf, ir_copy_t{src, dest})
+                    
+                    map_insert(state.locals, local, dest)
+                
                 case:
-                    transform_expr(expr, state, ir_buf)
+                    panic("unimplemented")
+                    // transform_expr(expr, state, ir_buf)
             }
-            
         
         case nil:
             panic("attempt to transform nil stmt!")
@@ -1367,8 +1380,8 @@ ir_state_t :: struct{
     var_counter: ^u32, 
     label_counter: ^u32,
     nodes: ^[dynamic]ir_value_t,
-    locals_stack: []variable_t,
-    locals: ^map[local_t]ir_var_t
+    locals_stack: []local_t,
+    locals: ^map[ref_local_t]ir_var_t
 }
 
 
@@ -1387,7 +1400,7 @@ ir_produce_global :: proc(expr: ^expr_t, state: ir_state_t, ir_buf: ^[dynamic]ir
     }
 }
 
-transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_instruction_t)-> ir_value_t {
+transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_instruction_t) -> ir_value_t {
     var_counter := state.var_counter;
     label_counter := state.label_counter
     #partial switch type in expr{
@@ -1467,9 +1480,9 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
 
             return res_var
 
-        case local_t:
+        case ref_local_t:
 
-            return state.locals[expr.(local_t)]
+            return state.locals[expr.(ref_local_t)]
         case func_info_t:
             panic("unreachable: functions should not be handled as expressions in ir")
             
