@@ -61,6 +61,7 @@ builtin_t :: enum {
     NONE = 0, 
 
     IF,
+    ELSE,
     WHILE,
     FOR,
     FN,
@@ -120,7 +121,7 @@ main :: proc(){
 
     parser:= parser_t{
         tokens=tokens[:], position=0, nodes=nodes, next_node=0, ptable=[32]u8{},
-        scope=0, global_symbols=make(map[identifier_t]^glob_const_t), 
+        scope=0, global_symbols=make(map[identifier_t]bool), 
         locals_stack=new([4096]local_t)[:], next_local=0, scope_ptrs=tracker[:], 
         in_proc=false, scope_ident_tracker=map[identifier_t]^scope_t{}, maybe_globals=make([dynamic]identifier_t)
     }
@@ -342,6 +343,7 @@ tokenize :: proc(buf: []u8) -> [dynamic]token_t {
             "for" = FOR,
             "while" = WHILE, 
             "if"= IF,
+            "else"=ELSE,
             "struct" = STRUCT, 
             "fn" = FN,
             "enum"= ENUM,
@@ -509,6 +511,8 @@ scope_t :: struct{
     next: ^scope_t
 }
 
+unit_t :: struct{}
+
 parser_t :: struct {
     tokens: []token_t,
     position: uint,
@@ -518,8 +522,11 @@ parser_t :: struct {
     
     ptable: [32]u8,
 
+    global_symbols: map[identifier_t]bool,
+    int_pool: map[identifier_t]int_literal_t,
+    function_pool: map[identifier_t]func_info_t,
+
     scope: u16,
-    global_symbols: map[identifier_t]^glob_const_t,
     locals_stack: []local_t,
     scope_ident_tracker: map[identifier_t]^scope_t,
     next_local: uint,
@@ -610,23 +617,34 @@ func_info_t :: struct{
 
 enum_info_t :: struct{}
 
+if_stmt_t :: struct{
+    cond: ^expr_t,
+    then: ^block_t,
+    otherwise: ^block_t
+}
+
 stmt_t :: union {
-    glob_const_t,
     local_const_t,
     vdecl_stmt_t,
     return_t,
     exprstmt_t,
-    block_t
+    block_t,
+    if_stmt_t,
+    empty_stmt_t,
 }
+
+empty_stmt_t:: struct{}
 
 block_t :: struct{
-    list: []stmt_t
+    list: ^[dynamic]stmt_t
 }
 
-glob_const_t :: struct{
-    name: identifier_t,
-    expr: expr_t
+new_block :: proc() -> block_t{
+    return block_t{
+        list=new([dynamic]stmt_t)
+    }
 }
+
 
 local_const_t :: struct{
     ref: ref_local_t
@@ -726,6 +744,15 @@ end_scope :: proc(parser: ^parser_t){
     parser.scope-=1
 }
 
+union_block :: proc(block: block_t, stmt: stmt_t) -> block_t{
+    append(block.list, stmt)
+    return block
+}
+
+global_symbol :: proc(parser: ^parser_t, name: identifier_t){
+    map_insert(&parser.global_symbols, name, true)
+}
+
 parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
     varname: identifier_t;
     typename: identifier_t;
@@ -741,7 +768,7 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
         begin_scope(parser)
         defer end_scope(parser)
 
-        list := make([dynamic]stmt_t);
+        list := new([dynamic]stmt_t);
         s: stmt_t = parse_stmt(parser)
         for {
             if s == nil{
@@ -751,12 +778,12 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                     panic("malformed block statement")
                 }
             }else{
-                append(&list, s)
+                append(list, s)
                 s= parse_stmt(parser)
             }
         }
 
-        return block_t{list[:len(list)]};
+        return block_t{list};
     }
 
     #partial switch token in current {
@@ -774,13 +801,20 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                     }
                     
                     if parser.scope == 0{
-                        decl := glob_const_t{
-                            varname, rhs
+                        
+                        #partial switch kind in rhs{
+                            case int_literal_t:
+                                map_insert(&parser.global_symbols, varname, true)
+                                map_insert(&parser.int_pool, varname, rhs.(int_literal_t))
+                            case func_info_t:
+                                // allocating for now
+                                map_insert(&parser.global_symbols, varname, false)
+                                map_insert(&parser.function_pool, varname, rhs.(func_info_t))
+                            case:
+                                panic("unimplemented constant expression")
                         }
-
-                        // allocating for now
-                        map_insert(&parser.global_symbols, varname, new_clone(decl))
-                        return decl
+                        
+                        return empty_stmt_t{}
                     }else{
                         ref := push_local(parser, local_t{
                             is_var=false, name=varname, expr=boxed_node(parser, rhs)
@@ -818,16 +852,42 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
         }
 
         case builtin_t:{
-            if current==builtin_t.RETURN{
-                advance(parser)
-                inner :=boxed_node(parser, parse_resolve_expr(parser))
-                if consume_token(parser, simple_token_t.SEMI_COLON){
-                    return return_t{
-                        inner
+            switch current{
+                case builtin_t.RETURN:{
+                    advance(parser)
+                    inner :=boxed_node(parser, parse_resolve_expr(parser))
+                    if consume_token(parser, simple_token_t.SEMI_COLON){
+                        return return_t{
+                            inner
+                        }
+                    }else{
+                        panic("malformed return stmt.")
                     }
-                }else{
-                    panic("malformed return stmt.")
                 }
+                case builtin_t.IF:{
+                    advance(parser)
+
+                    cond := parse_resolve_expr(parser)
+                    if !peek_token(parser, simple_token_t.LEFT_CURLY, 0){
+                        panic("expected if-condition body")
+                    }
+                    then_body := parse_stmt(parser)
+                    
+                    // ALLOCATING FOR NOW
+                    current_if := if_stmt_t{
+                        cond=boxed_node(parser, cond),
+                        then=new_clone(then_body.(block_t)),
+                        otherwise=nil
+                    }
+
+                    if consume_token(parser, builtin_t.ELSE){
+                        else_body := parse_stmt(parser)
+                        current_if.otherwise=new_clone(else_body.(block_t))
+                    }
+
+                    return current_if
+                }
+                case builtin_t.WHILE:
             }
         }
     }
@@ -1281,7 +1341,7 @@ naive_ir :: proc(parser: ^parser_t) -> []ir_instruction_t {
 
     for var in parser.maybe_globals{
         ref := parser.global_symbols[var]
-        if ref == nil{
+        if !ref {
             fmt.eprintln("undeclared symbol ", var)
             panic("")
         }else{
@@ -1304,12 +1364,13 @@ naive_ir :: proc(parser: ^parser_t) -> []ir_instruction_t {
         global_values=new(map[identifier_t]ir_value_t)
     }
     
-    for name, glob in parser.global_symbols{
-        transform_glob_const(glob, state, &ir_buf)
+
+    for name, some_int in parser.int_pool{
+        transform_int_literal(name, some_int, state, &ir_buf)
     }
-    
-    for stmt in all_stmts{
-        transform_stmt(stmt, state, &ir_buf)
+
+    for name, info in parser.function_pool{
+        transform_function(name, info, state, &ir_buf)
     }
 
     str := format_ir_buffer(ir_buf[:])
@@ -1325,6 +1386,14 @@ get_next_var :: proc(state: ir_state_t)->ir_var_t{
     return var
 }
 
+get_next_label :: proc(state: ir_state_t, name: string) -> ir_label_t{
+    state.label_counter^+=1;
+    return ir_label_t{
+        id=state.label_counter^-1,
+        name=name
+    }
+}
+
 transform_local_const :: proc(local: local_const_t, state: ir_state_t, ir_buf: ^[dynamic]ir_instruction_t){
     src := transform_expr(local.ref.expr, state, ir_buf)
     
@@ -1334,35 +1403,18 @@ transform_local_const :: proc(local: local_const_t, state: ir_state_t, ir_buf: ^
     map_insert(state.locals, local.ref, dest)
 }
 
-transform_glob_const :: proc(glob: ^glob_const_t, state: ir_state_t, ir_buf: ^[dynamic]ir_instruction_t){
-    expr := glob.expr;
-    #partial switch type in  expr{
-        case func_info_t:
-            transform_stmt(expr.(func_info_t).body, state, ir_buf)
-        
-        case ref_local_t:
-            local := expr.(ref_local_t)
-            src := transform_expr(local.expr, state, ir_buf)
-            
-            dest := get_next_var(state)
-            append(ir_buf, ir_copy_t{src, dest})
-            
-            map_insert(state.locals, local, dest)
-        
-        case int_literal_t:
-            dest := get_next_var(state)
-            append(ir_buf, ir_copy_t{src=expr.(int_literal_t), dest=dest})
-            map_insert(state.global_values, glob.name, dest)
-            
-        case:
-            panic("unimplemented")
-            // transform_expr(expr, state, ir_buf)
-    }
+transform_int_literal :: proc(varname: identifier_t, some_int: int_literal_t, state: ir_state_t, ir_buf: ^[dynamic]ir_instruction_t){
+    dest := get_next_var(state)
+    append(ir_buf, ir_copy_t{src=some_int, dest=dest})
+    map_insert(state.global_values, varname, dest)
 }
 
+transform_function :: proc(name: identifier_t, function: func_info_t, state: ir_state_t, ir_buf: ^[dynamic]ir_instruction_t){
+    transform_stmt(function.body, state, ir_buf)
+}
 
 transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_instruction_t) {
-    #partial switch type in stmt{
+    switch type in stmt{
         case return_t: {
             val := transform_expr(stmt.(return_t).inner, state, ir_buf)
             append(ir_buf, ir_emit_t {value=val })
@@ -1379,24 +1431,26 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
             
             src := transform_expr(var.expr, state, ir_buf)
 
-            dest := ir_var_t{name=state.var_counter^, ver=0 }
-            state.var_counter^+=1
+            dest := get_next_var(state)
             
             append(ir_buf, ir_copy_t{src, dest})
             
             map_insert(state.locals, var, dest)
             
-        case glob_const_t:
-            return; // ignore
-        
         case local_const_t:
             transform_local_const(stmt.(local_const_t), state, ir_buf)
+        
+        case exprstmt_t:
+            transform_expr(stmt.(exprstmt_t).inner, state, ir_buf)
+
+        case if_stmt_t:
+           panic("unimplemented")
+        
+        case empty_stmt_t:
+            return 
 
         case nil:
             panic("attempt to transform nil stmt!")
-
-        case exprstmt_t:
-            transform_expr(stmt.(exprstmt_t).inner, state, ir_buf)
 
         case:
             panic("unimplemented!")
@@ -1428,10 +1482,9 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
 
         case binexpr_t:{
             this :=expr.(binexpr_t); 
-            tvar := var_counter^
-            var_counter^+=1
+            
             src_left := transform_expr(this.left, state, ir_buf);
-            dest := ir_var_t{name=tvar, ver=0}
+            dest := get_next_var(state)
 
             src_right := transform_expr(this.right, state, ir_buf);
             instruction : ir_instruction_t = ir_binary_t{
@@ -1448,13 +1501,10 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
         case ifexpr_t:
             this := expr.(ifexpr_t)
             
-            res_var: ir_var_t ={ var_counter^, 0}
+            res_var := get_next_var(state)
 
-            var_counter^+=1
-            false_label := ir_label_t{label_counter^, "false"}
-            combine := ir_label_t{label_counter^+1, "combine"}
-            
-            label_counter^+=2
+            false_label := get_next_label(state, "false")
+            combine := get_next_label(state, "combine")
             
             cond := transform_expr(this.cond, state, ir_buf)
             jz := ir_jz_label_t{
@@ -1477,7 +1527,9 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
             
             append_label(false_label, ir_buf)
             otherwise := transform_expr(this.otherwise, state, ir_buf)
+            
             res_var.ver+=1
+            
             copy_f := ir_copy_t{
                 src=otherwise, dest=res_var
             }
