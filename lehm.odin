@@ -100,7 +100,7 @@ main :: proc(){
     using binop_t
 
     fmt.printfln("sizeof(parser_t): %d bytes", size_of(parser_t))
-    // fmt.printfln("sizeof(scope_node_t): %d bytes", size_of(scope_t))
+    fmt.printfln("sizeof(ir_state_t): %d bytes", size_of(ir_state_t))
 
     test := "0b1111_1111"
     assert(parse_binary_literal(transmute([]u8)test) == 255)
@@ -596,8 +596,8 @@ const_kind_t :: enum{
 }
 
 assign_t :: struct{
-    varname: ^expr_t,
-    rhs: ^expr_t
+    left: ^expr_t,
+    right: ^expr_t
 }
 
 struct_info_t :: struct{
@@ -775,6 +775,7 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                 if consume_token(parser, simple_token_t.RIGHT_CURLY){
                     break;
                 }else{
+                    fmt.eprintln(parser.tokens[parser.position])
                     panic("malformed block statement")
                 }
             }else{
@@ -917,13 +918,15 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
                 if peek_token(parser, simple_token_t.EQ, 1){
                     parser.position+=2;
                     rhs := boxed_node(parser, parse_resolve_expr(parser))
-                    if !consume_token(parser, simple_token_t.SEMI_COLON){
-                        panic("malformed assignment")
-                    }
+                    
                     assign_to := boxed_node(parser, some_ident)
-                    return assign_t{
-                        assign_to, rhs
+                    
+                    assert(rhs != assign_to)
+
+                    assign :=  assign_t{
+                        left=assign_to, right=rhs
                     }
+                    return assign
                 }
             }
 
@@ -989,8 +992,8 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
 
             case assign_t:
                 _a := expr.(assign_t)
-                _a.rhs = __resolve_expr(parser, _a.rhs)
-                _a.varname = __resolve_expr(parser, _a.varname)
+                _a.right = __resolve_expr(parser, _a.right)
+                _a.left = __resolve_expr(parser, _a.left)
                 
                 expr^ = _a 
                 return expr
@@ -1408,7 +1411,7 @@ transform_local_const :: proc(local: local_const_t, state: ir_state_t, ir_buf: ^
     src := transform_expr(local.ref.expr, state, ir_buf)
     
     dest := get_next_var(state)    
-    ir_copy(&dest, src, state, ir_buf)
+    ir_copy(&dest, src, state)
     
     map_insert(state.locals, local.ref, dest)
 }
@@ -1416,7 +1419,7 @@ transform_local_const :: proc(local: local_const_t, state: ir_state_t, ir_buf: ^
 transform_int_literal :: proc(varname: identifier_t, some_int: int_literal_t, state: ir_state_t, ir_buf: ^[dynamic]ir_instruction_t){
     dest := get_next_var(state)
     
-    ir_copy(&dest, some_int, state, ir_buf)
+    ir_copy(&dest, some_int, state)
 
     map_insert(state.global_values, varname, dest)
 }
@@ -1444,7 +1447,7 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
             src := transform_expr(var.expr, state, ir_buf)
 
             dest := get_next_var(state)
-            ir_copy(&dest, src, state, ir_buf)
+            ir_copy(&dest, src, state)
             
             map_insert(state.locals, var, dest)
             
@@ -1492,7 +1495,9 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
     }
 }
 
-ir_copy :: proc (dest: ^ir_var_t, src: ir_value_t, state: ir_state_t, ir_buf: ^[dynamic]ir_instruction_t){
+ir_copy :: proc (dest: ^ir_var_t, src: ir_value_t, state: ir_state_t){
+    ir_buf := state.ir_buf
+
     ver := state.track_versions[dest.name]
     dest.ver = ver
     
@@ -1562,7 +1567,7 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
 
 
             then := transform_expr(this.then, state, ir_buf)
-            ir_copy(&res_var, then, state, ir_buf)
+            ir_copy(&res_var, then, state)
             j := ir_jump_label_t {
                 to=combine
             }
@@ -1571,12 +1576,12 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
 
             emit_label(false_label, ir_buf)
             otherwise := transform_expr(this.otherwise, state, ir_buf)
-            ir_copy(&res_var, otherwise, state, ir_buf)
+            ir_copy(&res_var, otherwise, state)
 
 
             emit_label(combine, ir_buf)
             phony := ir_phony_t{src=res_var.name, fro=0, to=res_var.ver}
-            ir_copy(&res_var, phony, state, ir_buf)
+            ir_copy(&res_var, phony, state)
             return res_var
 
         case ref_local_t:
@@ -1585,9 +1590,23 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
         case identifier_t:
             return state.global_values[expr.(identifier_t)]
         
+        case assign_t:
+            assignment := expr.(assign_t)
+            
+            var_ref := assignment.left.(ref_local_t)
+            var := state.locals[var_ref]
+            
+            assert(assignment.right != assignment.left)
+
+            right := transform_expr(assignment.right, state, ir_buf)
+            
+            ir_copy(&var, right, state)
+            map_insert(state.locals, var_ref, var)
+            return var
+
         case func_info_t:
             panic("unreachable: functions should not be handled as expressions in ir")
-
+        
         case: 
             fmt.println("transforming: ", expr^)
             panic("unimplemented! ")
