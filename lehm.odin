@@ -1403,6 +1403,13 @@ get_next_var :: proc(state: ir_state_t)->ir_var_t{
     return var
 }
 
+get_next_varname :: proc(state: ir_state_t)->ir_varname_t{
+    new_name := ir_varname_t(state.var_counter^)
+    map_insert(state.track_versions, new_name, 0)
+    state.var_counter^+=1
+    return new_name
+}
+
 get_next_label :: proc(state: ir_state_t, name: string) -> label_t{
     state.label_counter^+=1;
     return label_t{
@@ -1465,13 +1472,10 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
             is_main :=state.is_main_br^ 
             _if := stmt.(if_stmt_t)
 
-            res_var := get_next_var(state)
-
-            _else : label_t = get_next_label(state, "else")
-            combine : label_t = begin_mainbr(state)
+            _else := get_next_label(state, "else")
+            combine := begin_mainbr(state)
             
             cond := transform_expr(_if.cond, state, ir_buf)
-            
             jump_if_false := ir_jz_label_t{
                 cond, _else
             }
@@ -1612,6 +1616,15 @@ ir_state_t :: struct{
 
 branch_entry_t :: struct{name: ir_varname_t, from: u32, to: u32}
 
+
+// NOTE(yousef): this is to replace the pattern:
+// state.track_versions[varname]-1 because it is error-prone
+latest_valid :: proc(state: ir_state_t, varname: ir_varname_t) -> ir_var_t{
+    return ir_var_t{
+        varname, state.track_versions[varname]-1
+    }
+}
+
 transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_instruction_t) -> ir_value_t {
     var_counter := state.var_counter;
     label_counter := state.label_counter
@@ -1638,13 +1651,14 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
             return dest
         }
 
-        case if_expr_t:
-            panic("ifexpr unimplemented")
-            /*
+        case if_expr_t:{
+            is_main := state.is_main_br^
             this := expr.(if_expr_t)
-            res_var := get_next_var(state)
+            
+            res_varname := get_next_varname(state)
+
             false_label := get_next_label(state, "false")
-            combine := get_next_label(state, "combine")
+            combine := begin_mainbr(state)
             
             
             cond := transform_expr(this.cond, state, ir_buf)
@@ -1655,7 +1669,7 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
 
 
             then := transform_expr(this.then, state, ir_buf)
-            ir_copy(&res_var, then, state)
+            ir_copy(res_varname, then, state)
             j := ir_jump_label_t {
                 to=combine
             }
@@ -1663,19 +1677,21 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
             
 
             emit_label(false_label, ir_buf)
+            begin_altbr(state)
             otherwise := transform_expr(this.otherwise, state, ir_buf)
-            ir_copy(&res_var, otherwise, state)
+            ir_copy(res_varname, otherwise, state)
 
 
             emit_label(combine, ir_buf)
-            phony := ir_phony_t{src=res_var.name, fro=0, to=res_var.ver}
-            ir_copy(&res_var, phony, state)
-            return res_var
-            */
+            state.is_main_br^=is_main 
+            begin_combine(state)
+
+            return latest_valid(state, res_varname)
+        }
 
         case ref_local_t:
             varname := state.locals[expr.(ref_local_t)]
-            vers := state.track_versions[varname]-1
+            vers := latest_valid(state, varname).ver
             return ir_var_t{
                 name=varname, ver=vers
             }
@@ -1689,15 +1705,11 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
             var_ref := assignment.left.(ref_local_t)
             varname := state.locals[var_ref]
 
-            assert(assignment.right != assignment.left)
-
             right := transform_expr(assignment.right, state, ir_buf)
             
             ir_copy(varname, right, state)
             map_insert(state.locals, var_ref, varname)
-            dest := ir_var_t {
-                name=varname, ver=state.track_versions[varname]-1
-            }
+            dest := latest_valid(state, varname)
             return dest
 
         case func_info_t:
