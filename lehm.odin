@@ -130,7 +130,25 @@ main :: proc(){
     
     assert(parser.ptable[binop_t.MULT] == 50)
 
-    naive_ir(&parser)
+        stmt : stmt_t;
+
+    all_stmts := make([dynamic]stmt_t)
+
+    for stmt := parse_stmt(&parser); stmt!=nil ; stmt=parse_stmt(&parser){
+        append(&all_stmts, stmt)
+    }
+
+    for var in parser.maybe_globals{
+        ref := parser.global_symbols[var]
+        if !ref {
+            fmt.eprintln("undeclared symbol ", var)
+            panic("")
+        }else{
+            // fmt.eprintln("symbol is ", ref^)
+        }
+    }
+
+    naive_ir(&parser, all_stmts)
 }
 
 init_precedence :: proc(parser: ^parser_t){
@@ -752,11 +770,6 @@ end_scope :: proc(parser: ^parser_t){
     parser.scope-=1
 }
 
-union_block :: proc(block: block_t, stmt: stmt_t) -> block_t{
-    append(block.list, stmt)
-    return block
-}
-
 global_symbol :: proc(parser: ^parser_t, name: identifier_t){
     map_insert(&parser.global_symbols, name, true)
 }
@@ -1317,7 +1330,7 @@ parse_prim :: proc(parser: ^parser_t) -> expr_t{
     return nil
 }
 
-/*-----IR-----*/
+/*---------------IR---------------*/
 ir_varname_t :: distinct u32
 
 ir_var_t :: struct {name: ir_varname_t, ver: u32};
@@ -1356,42 +1369,42 @@ ir_phony_t :: struct{
     to: u32
 }
 
-naive_ir :: proc(parser: ^parser_t) -> []ir_instruction_t {
-    stmt : stmt_t;
+ir_state_t :: struct{
+    ir_buf: ^[dynamic]ir_instruction_t,
 
-    all_stmts := make([dynamic]stmt_t)
+    var_counter: ^u32, 
+    label_counter: ^u32,
 
-    for stmt := parse_stmt(parser); stmt!=nil ; stmt=parse_stmt(parser){
-        append(&all_stmts, stmt)
-    }
-
-    for var in parser.maybe_globals{
-        ref := parser.global_symbols[var]
-        if !ref {
-            fmt.eprintln("undeclared symbol ", var)
-            panic("")
-        }else{
-            // fmt.eprintln("symbol is ", ref^)
-        }
-    }
+    global_values: ^map[identifier_t]ir_value_t,
+    track_versions: ^map[ir_varname_t]u32,
     
+    locals: ^map[ref_local_t]ir_varname_t,
+
+    br_ids_st: ^[dynamic]u32,
+    br_active: ^u32,
+    br_is_main: ^bool,
+    br_table: ^map[u32][dynamic]branch_entry_t,
+}
+
+branch_entry_t :: struct{name: ir_varname_t, from: u32, to: u32}
+
+
+naive_ir :: proc(parser: ^parser_t, list: [dynamic]stmt_t) -> []ir_instruction_t {
     var_counter : u32 = 0; 
     label_counter: u32 = 0;
-    nodes: =make([dynamic]ir_value_t)
     
     state := ir_state_t{
         ir_buf=new([dynamic]ir_instruction_t),
         label_counter=&label_counter,
         var_counter=&var_counter,
-        nodes=&nodes,
         
         global_values=new(map[identifier_t]ir_value_t),
         track_versions=new(map[ir_varname_t]u32),
-        branching_active=new(u32),
-        is_main_br = new(bool),
+        br_active=new(u32),
+        br_is_main = new(bool),
         // TODO(yousef): reset "stack" after calling combine()
-        branching = new(map[u32] [dynamic]branch_entry_t),
-        br_stack=new([dynamic]u32),
+        br_table = new(map[u32] [dynamic]branch_entry_t),
+        br_ids_st=new([dynamic]u32),
         locals = new(map[ref_local_t]ir_varname_t)
     }
     ir_buf := state.ir_buf;
@@ -1413,28 +1426,6 @@ naive_ir :: proc(parser: ^parser_t) -> []ir_instruction_t {
     return ir_buf[:len(ir_buf)];
 }
 
-get_next_var :: proc(state: ir_state_t)->ir_var_t{
-    new_var := ir_varname_t(state.var_counter^)
-    map_insert(state.track_versions, new_var, 0)
-    var := ir_var_t{name=new_var, ver=0 }
-    state.var_counter^+=1
-    return var
-}
-
-get_next_varname :: proc(state: ir_state_t)->ir_varname_t{
-    new_name := ir_varname_t(state.var_counter^)
-    map_insert(state.track_versions, new_name, 0)
-    state.var_counter^+=1
-    return new_name
-}
-
-get_next_label :: proc(state: ir_state_t, name: string) -> label_t{
-    state.label_counter^+=1;
-    return label_t{
-        id=state.label_counter^-1,
-        name=name
-    }
-}
 
 transform_local_const :: proc(local: local_const_t, state: ir_state_t, ir_buf: ^[dynamic]ir_instruction_t){
     src := transform_expr(local.ref.expr, state, ir_buf)
@@ -1449,7 +1440,7 @@ transform_int_literal :: proc(varname: identifier_t, some_int: int_literal_t, st
     dest := get_next_var(state)
     
     ir_copy(dest.name, some_int, state)
-
+    
     map_insert(state.global_values, varname, dest)
 }
 
@@ -1491,7 +1482,7 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
             transform_expr(stmt.(exprstmt_t).inner, state, ir_buf)
 
         case if_stmt_t:{
-            is_main :=state.is_main_br^ 
+            is_main :=state.br_is_main^ 
             _if := stmt.(if_stmt_t)
 
             _else := get_next_label(state, "else")
@@ -1514,7 +1505,7 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
             transform_stmt(_if.otherwise^, state, ir_buf)
 
             emit_label(combine, ir_buf)
-            state.is_main_br^ = is_main
+            state.br_is_main^ = is_main
             begin_combine(state)
         }
             
@@ -1527,123 +1518,6 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
         case:
             panic("unimplemented!")
 
-    }
-}
-
-begin_mainbr :: proc(state: ir_state_t) ->label_t {
-    combine := get_next_label(state, "combine")
-    append(state.br_stack, combine.id)
-    
-    state.branching_active^ +=1
-    state.is_main_br^=true 
-    state.branching[combine.id] = make_dynamic_array([dynamic]branch_entry_t)
-
-    return combine
-}
-
-// ends mainbr: 
-begin_altbr :: proc(state: ir_state_t) {
-    assert(state.branching_active^>0)
-    
-    state.is_main_br^ = false
-}
-
-begin_combine :: proc(state: ir_state_t){
-    state.branching_active^ -=1
-    combine_id := pop(state.br_stack)
-    
-    ir_buf := state.ir_buf
-
-    for entry in state.branching[combine_id]{
-        assert(entry.from | 0xFFFF == 0xFFFF_FFFF)
-        
-        if entry.to | 0xFFFF != 0xFFFF_FFFF{       
-            src_var := ir_var_t{
-                name=entry.name, ver=entry.from&0x0000FFFF
-            }
-            ir_copy(entry.name, src_var, state)
-        }else{
-            phony := ir_phony_t{
-                fro=entry.from & 0x0000FFFF,
-                to=entry.to & 0x0000FFFF,
-                src=entry.name
-            }
-
-            ir_copy(entry.name, phony, state)
-
-        }
-    }
-}
-
-ir_copy :: proc (dest_name: ir_varname_t, src: ir_value_t, state: ir_state_t){
-    ir_buf := state.ir_buf
-    ver := state.track_versions[dest_name]
-    dest := ir_var_t{
-        name= dest_name, ver =ver 
-    } 
-    copy := ir_copy_t{
-            dest=dest, src=src
-    }
-
-    map_insert(state.track_versions, dest.name, dest.ver+1)
-
-    append(ir_buf, copy)
-
-    if state.branching_active^>0 {
-        if state.is_main_br^{
-            br_id := state.br_stack[len(state.br_stack)-1]
-            array := state.branching[br_id]
-
-            append(&array, branch_entry_t{
-                name=dest.name, from=0xFFFF0000|dest.ver, to = 0
-            })
-            state.branching[br_id]=array
-        }else{
-            br_id := state.br_stack[len(state.br_stack)-1]
-            array := state.branching[br_id]
-            
-            for i in 0..<len(array){
-                entry := array[i]
-                if entry.name == dest.name{
-                    neu := entry 
-                    assert(neu.from | 0xFFFF == 0xFFFF_FFFF)
-                    neu.to = dest.ver | 0xFFFF_0000
-                    array[i]=neu
-                }
-            }
-            state.branching[br_id]=array
-        }
-    }
-}
-
-emit_label :: proc(label: label_t, ir_buf: ^[dynamic]ir_instruction_t){
-    instr := ir_label_at_t{is=label}
-    append(ir_buf, instr)
-}
-
-ir_state_t :: struct{
-    var_counter: ^u32, 
-    label_counter: ^u32,
-    nodes: ^[dynamic]ir_value_t,
-    locals_stack: []local_t,
-    global_values: ^map[identifier_t]ir_value_t,
-    track_versions: ^map[ir_varname_t]u32,
-    ir_buf: ^[dynamic]ir_instruction_t,
-    branching_active: ^u32,
-    is_main_br: ^bool,
-    branching: ^map[u32][dynamic]branch_entry_t,
-    br_stack: ^[dynamic]u32,
-    locals: ^map[ref_local_t]ir_varname_t,
-}
-
-branch_entry_t :: struct{name: ir_varname_t, from: u32, to: u32}
-
-
-// NOTE(yousef): this is to replace the pattern:
-// state.track_versions[varname]-1 because it is error-prone
-latest_valid :: proc(state: ir_state_t, varname: ir_varname_t) -> ir_var_t{
-    return ir_var_t{
-        varname, state.track_versions[varname]-1
     }
 }
 
@@ -1675,7 +1549,7 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
         }
 
         case if_expr_t:{
-            is_main := state.is_main_br^
+            is_main := state.br_is_main^
             this := expr.(if_expr_t)
             
             res_varname := get_next_varname(state)
@@ -1706,7 +1580,7 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
 
 
             emit_label(combine, ir_buf)
-            state.is_main_br^=is_main 
+            state.br_is_main^=is_main 
             begin_combine(state)
 
             return latest_valid(state, res_varname)
@@ -1745,6 +1619,131 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
             panic("unimplemented! ")
     }
 }
+
+begin_mainbr :: proc(state: ir_state_t) ->label_t {
+    combine := get_next_label(state, "combine")
+    append(state.br_ids_st, combine.id)
+    
+    state.br_active^ +=1
+    state.br_is_main^=true 
+    state.br_table[combine.id] = make_dynamic_array([dynamic]branch_entry_t)
+
+    return combine
+}
+
+// ends mainbr: 
+begin_altbr :: proc(state: ir_state_t) {
+    assert(state.br_active^>0)
+    
+    state.br_is_main^ = false
+}
+
+begin_combine :: proc(state: ir_state_t){
+    state.br_active^ -=1
+    combine_id := pop(state.br_ids_st)
+    
+    ir_buf := state.ir_buf
+
+    for entry in state.br_table[combine_id]{
+        assert(entry.from | 0xFFFF == 0xFFFF_FFFF)
+        
+        if entry.to | 0xFFFF != 0xFFFF_FFFF{       
+            src_var := ir_var_t{
+                name=entry.name, ver=entry.from&0x0000FFFF
+            }
+            ir_copy(entry.name, src_var, state)
+        }else{
+            phony := ir_phony_t{
+                fro=entry.from & 0x0000FFFF,
+                to=entry.to & 0x0000FFFF,
+                src=entry.name
+            }
+
+            ir_copy(entry.name, phony, state)
+
+        }
+    }
+}
+
+ir_copy :: proc (dest_name: ir_varname_t, src: ir_value_t, state: ir_state_t){
+    ir_buf := state.ir_buf
+    ver := state.track_versions[dest_name]
+    dest := ir_var_t{
+        name= dest_name, ver =ver 
+    } 
+    copy := ir_copy_t{
+            dest=dest, src=src
+    }
+
+    map_insert(state.track_versions, dest.name, dest.ver+1)
+
+    append(ir_buf, copy)
+
+    if state.br_active^>0 {
+        if state.br_is_main^{
+            br_id := state.br_ids_st[len(state.br_ids_st)-1]
+            array := state.br_table[br_id]
+
+            append(&array, branch_entry_t{
+                name=dest.name, from=0xFFFF0000|dest.ver, to = 0
+            })
+            state.br_table[br_id]=array
+        }else{
+            br_id := state.br_ids_st[len(state.br_ids_st)-1]
+            array := state.br_table[br_id]
+            
+            for i in 0..<len(array){
+                entry := array[i]
+                if entry.name == dest.name{
+                    neu := entry 
+                    assert(neu.from | 0xFFFF == 0xFFFF_FFFF)
+                    neu.to = dest.ver | 0xFFFF_0000
+                    array[i]=neu
+                }
+            }
+            state.br_table[br_id]=array
+        }
+    }
+}
+
+emit_label :: proc(label: label_t, ir_buf: ^[dynamic]ir_instruction_t){
+    instr := ir_label_at_t{is=label}
+    append(ir_buf, instr)
+}
+
+get_next_var :: proc(state: ir_state_t)->ir_var_t{
+    new_var := ir_varname_t(state.var_counter^)
+    map_insert(state.track_versions, new_var, 0)
+    var := ir_var_t{name=new_var, ver=0 }
+    state.var_counter^+=1
+    return var
+}
+
+get_next_varname :: proc(state: ir_state_t)->ir_varname_t{
+    new_name := ir_varname_t(state.var_counter^)
+    map_insert(state.track_versions, new_name, 0)
+    state.var_counter^+=1
+    return new_name
+}
+
+// NOTE(yousef): this is to replace the pattern:
+// state.track_versions[varname]-1 because it is error-prone
+latest_valid :: proc(state: ir_state_t, varname: ir_varname_t) -> ir_var_t{
+    return ir_var_t{
+        varname, state.track_versions[varname]-1
+    }
+}
+
+get_next_label :: proc(state: ir_state_t, name: string) -> label_t{
+    state.label_counter^+=1;
+    return label_t{
+        id=state.label_counter^-1,
+        name=name
+    }
+}
+
+
+// ************FORMATTING IR_BUFFER************
 
 import "core:strings"
 
