@@ -1368,10 +1368,14 @@ naive_ir :: proc(parser: ^parser_t) -> []ir_instruction_t {
         var_counter=&var_counter,
         nodes=&nodes,
         locals_stack=parser.locals_stack,
-        locals=new(map[ref_local_t]ir_var_t),
+        locals=new(map[ref_local_t]ir_varname_t),
         global_values=new(map[identifier_t]ir_value_t),
         track_versions=new(map[ir_varname_t]u32),
-        ir_buf=new([dynamic]ir_instruction_t)
+        ir_buf=new([dynamic]ir_instruction_t),
+        branching_active=new(u32),
+        is_main_br = new(bool),
+        branching = new(map[u32] [dynamic]branch_entry_t),
+        br_stack=new([dynamic]u32)
     }
     ir_buf := state.ir_buf;
     
@@ -1411,15 +1415,15 @@ transform_local_const :: proc(local: local_const_t, state: ir_state_t, ir_buf: ^
     src := transform_expr(local.ref.expr, state, ir_buf)
     
     dest := get_next_var(state)    
-    ir_copy(&dest, src, state)
+    ir_copy(dest.name, src, state)
     
-    map_insert(state.locals, local.ref, dest)
+    map_insert(state.locals, local.ref, dest.name)
 }
 
 transform_int_literal :: proc(varname: identifier_t, some_int: int_literal_t, state: ir_state_t, ir_buf: ^[dynamic]ir_instruction_t){
     dest := get_next_var(state)
     
-    ir_copy(&dest, some_int, state)
+    ir_copy(dest.name, some_int, state)
 
     map_insert(state.global_values, varname, dest)
 }
@@ -1447,9 +1451,9 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
             src := transform_expr(var.expr, state, ir_buf)
 
             dest := get_next_var(state)
-            ir_copy(&dest, src, state)
+            ir_copy(dest.name, src, state)
             
-            map_insert(state.locals, var, dest)
+            map_insert(state.locals, var, dest.name)
             
         case local_const_t:
             transform_local_const(stmt.(local_const_t), state, ir_buf)
@@ -1462,9 +1466,9 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
 
             res_var := get_next_var(state)
 
-            _else := get_next_label(state, "else")
-            combine := get_next_label(state, "combine")
-
+            _else : label_t = get_next_label(state, "else")
+            combine : label_t = begin_mainbr(state)
+            
             cond := transform_expr(_if.cond, state, ir_buf)
             
             jump_if_false := ir_jz_label_t{
@@ -1479,10 +1483,11 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
             append(ir_buf, jump_combine)
 
             emit_label(_else, ir_buf)
+            begin_altbr(state)
             transform_stmt(_if.otherwise^, state, ir_buf)
 
             emit_label(combine, ir_buf)
-        
+            begin_combine(state)
         case empty_stmt_t:
             return 
 
@@ -1495,19 +1500,91 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
     }
 }
 
-ir_copy :: proc (dest: ^ir_var_t, src: ir_value_t, state: ir_state_t){
+begin_mainbr :: proc(state: ir_state_t) ->label_t {
+    combine := get_next_label(state, "combine")
+    append(state.br_stack, combine.id)
+    
+    state.branching_active^ +=1
+    state.is_main_br^=true 
+    state.branching[combine.id] = make_dynamic_array([dynamic]branch_entry_t)
+
+    return combine
+}
+
+// ends mainbr: 
+begin_altbr :: proc(state: ir_state_t) {
+    assert(state.branching_active^>0)
+    
+    state.is_main_br^ = false
+}
+
+begin_combine :: proc(state: ir_state_t){
+    state.branching_active^ -=1
+    state.is_main_br^= true
+    combine_id := pop(state.br_stack)
+    
     ir_buf := state.ir_buf
 
-    ver := state.track_versions[dest.name]
-    dest.ver = ver
-    
-    map_insert(state.track_versions, dest.name, ver+1)
+    for entry in state.branching[combine_id]{
+        assert(entry.from | 0xFFFF == 0xFFFF_FFFF)
+        
+        if entry.to | 0xFFFF != 0xFFFF_FFFF{       
+            src_var := ir_var_t{
+                name=entry.name, ver=entry.from&0x0000FFFF
+            }
+            ir_copy(entry.name, src_var, state)
+        }else{
+            phony := ir_phony_t{
+                fro=entry.from & 0x0000FFFF,
+                to=entry.to & 0x0000FFFF,
+                src=entry.name
+            }
 
+            ir_copy(entry.name, phony, state)
+
+        }
+    }
+}
+
+ir_copy :: proc (dest_name: ir_varname_t, src: ir_value_t, state: ir_state_t){
+    ir_buf := state.ir_buf
+    ver := state.track_versions[dest_name]
+    dest := ir_var_t{
+        name= dest_name, ver =ver 
+    } 
     copy := ir_copy_t{
-        dest=dest^, src=src
+            dest=dest, src=src
     }
 
+    map_insert(state.track_versions, dest.name, dest.ver+1)
+
     append(ir_buf, copy)
+
+    if state.branching_active^>0 {
+        if state.is_main_br^{
+            br_id := state.br_stack[len(state.br_stack)-1]
+            array := state.branching[br_id]
+
+            append(&array, branch_entry_t{
+                name=dest.name, from=0xFFFF0000|dest.ver, to = 0
+            })
+            state.branching[br_id]=array
+        }else{
+            br_id := state.br_stack[len(state.br_stack)-1]
+            array := state.branching[br_id]
+            
+            for i in 0..<len(array){
+                entry := array[i]
+                if entry.name == dest.name{
+                    neu := entry 
+                    assert(neu.from | 0xFFFF == 0xFFFF_FFFF)
+                    neu.to = dest.ver | 0xFFFF_0000
+                    array[i]=neu
+                }
+            }
+            state.branching[br_id]=array
+        }
+    }
 }
 
 emit_label :: proc(label: label_t, ir_buf: ^[dynamic]ir_instruction_t){
@@ -1520,11 +1597,17 @@ ir_state_t :: struct{
     label_counter: ^u32,
     nodes: ^[dynamic]ir_value_t,
     locals_stack: []local_t,
-    locals: ^map[ref_local_t]ir_var_t,
+    locals: ^map[ref_local_t]ir_varname_t,
     global_values: ^map[identifier_t]ir_value_t,
     track_versions: ^map[ir_varname_t]u32,
-    ir_buf: ^[dynamic]ir_instruction_t
+    ir_buf: ^[dynamic]ir_instruction_t,
+    branching_active: ^u32,
+    is_main_br: ^bool,
+    branching: ^map[u32][dynamic]branch_entry_t,
+    br_stack: ^[dynamic]u32
 }
+
+branch_entry_t :: struct{name: ir_varname_t, from: u32, to: u32}
 
 transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_instruction_t) -> ir_value_t {
     var_counter := state.var_counter;
@@ -1553,6 +1636,8 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
         }
 
         case if_expr_t:
+            panic("ifexpr unimplemented")
+            /*
             this := expr.(if_expr_t)
             res_var := get_next_var(state)
             false_label := get_next_label(state, "false")
@@ -1583,9 +1668,14 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
             phony := ir_phony_t{src=res_var.name, fro=0, to=res_var.ver}
             ir_copy(&res_var, phony, state)
             return res_var
+            */
 
         case ref_local_t:
-            return state.locals[expr.(ref_local_t)]
+            varname := state.locals[expr.(ref_local_t)]
+            vers := state.track_versions[varname]-1
+            return ir_var_t{
+                name=varname, ver=vers
+            }
 
         case identifier_t:
             return state.global_values[expr.(identifier_t)]
@@ -1594,15 +1684,18 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
             assignment := expr.(assign_t)
             
             var_ref := assignment.left.(ref_local_t)
-            var := state.locals[var_ref]
-            
+            varname := state.locals[var_ref]
+
             assert(assignment.right != assignment.left)
 
             right := transform_expr(assignment.right, state, ir_buf)
             
-            ir_copy(&var, right, state)
-            map_insert(state.locals, var_ref, var)
-            return var
+            ir_copy(varname, right, state)
+            map_insert(state.locals, var_ref, varname)
+            dest := ir_var_t {
+                name=varname, ver=state.track_versions[varname]-1
+            }
+            return dest
 
         case func_info_t:
             panic("unreachable: functions should not be handled as expressions in ir")
