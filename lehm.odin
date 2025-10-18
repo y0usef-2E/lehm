@@ -122,7 +122,7 @@ main :: proc(){
     parser:= parser_t{
         tokens=tokens[:], position=0, nodes=nodes, next_node=0, ptable=[32]u8{},
         scope=0, global_symbols=make(map[identifier_t]bool), 
-        locals_stack=new([4096]local_t)[:], next_local=0, scope_ptrs=tracker[:], 
+        locals_stack=new([4096]^local_t)[:], next_local=0, scope_ptrs=tracker[:], 
         in_proc=false, scope_ident_tracker=map[identifier_t]^scope_t{}, maybe_globals=make([dynamic]identifier_t)
     }
 
@@ -527,13 +527,19 @@ parser_t :: struct {
     function_pool: map[identifier_t]func_info_t,
 
     scope: u16,
-    locals_stack: []local_t,
+    locals_stack: []^local_t,
     scope_ident_tracker: map[identifier_t]^scope_t,
     next_local: uint,
     scope_ptrs: []uint,
     maybe_globals: [dynamic]identifier_t,
 
-    in_proc: bool
+    in_proc: bool,
+    var_id: u32
+}
+
+next_var_id :: proc(parser:^parser_t) -> u32{
+    parser.var_id+=1
+    return parser.var_id-1
 }
 
 consume_token :: proc(parser: ^parser_t, t: token_t) -> bool{
@@ -650,11 +656,12 @@ local_const_t :: struct{
     ref: ref_local_t
 }
 
-ref_local_t :: distinct ^local_t
+ref_local_t :: ^local_t
 
 local_t :: struct{
     is_var: bool,
     name: identifier_t,
+    id: u32,
     expr: ^expr_t
 }
 
@@ -725,13 +732,14 @@ scope_mhave_ident :: proc(parser: ^parser_t, scope: u16, ident: identifier_t) ->
 }
 
 push_local :: proc(parser: ^parser_t, var: local_t)-> ref_local_t{
-    parser.locals_stack[parser.next_local]=var
+    at := new_clone(var)
+    parser.locals_stack[parser.next_local]=at
 
     parser.next_local+=1
     
     note_scope(parser, var.name)
-    at := ref_local_t(&parser.locals_stack[parser.next_local-1])
-    return at
+    // fmt.eprintln("generated: ", uintptr(at), "= ", at^)
+    return ref_local_t(at)
 }
 
 begin_scope :: proc(parser: ^parser_t){
@@ -818,7 +826,7 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                         return empty_stmt_t{}
                     }else{
                         ref := push_local(parser, local_t{
-                            is_var=false, name=varname, expr=boxed_node(parser, rhs)
+                            is_var=false, name=varname, id=next_var_id(parser), expr=boxed_node(parser, rhs)
                         })
                         return local_const_t(local_const_t{ref})
                     }
@@ -844,8 +852,9 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                     }
                     
                     at := push_local(parser, local_t{
-                        is_var=true, name=varname, expr=boxed_node(parser, rhs)
+                        is_var=true, name=varname, id=next_var_id(parser), expr=boxed_node(parser, rhs)
                     })
+                    // fmt.eprintln(at)
 
                     return vdecl_stmt_t{at}
                 }
@@ -856,8 +865,12 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
             switch current{
                 case builtin_t.RETURN:{
                     advance(parser)
-                    inner :=boxed_node(parser, parse_resolve_expr(parser))
+                    // FIXME(yousef): dynamic allocation 
+                    inner:^expr_t=new_clone(parse_resolve_expr(parser))
+                    
                     if consume_token(parser, simple_token_t.SEMI_COLON){
+                        // fmt.eprintln("returning: ", uintptr(inner^.(ref_local_t)))
+                        
                         return return_t{
                             inner
                         }
@@ -965,10 +978,11 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
                             
                             if local.name == ident{
                                 // fmt.println("resolving: ", ident)
-                                expr^= ref_local_t(&parser.locals_stack[j])
+                                expr^= parser.locals_stack[j]
                                 // fmt.println("is: ", expr^)
                                 recur := __resolve_expr(parser, expr)
                                 // fmt.println("is actually: ", recur^)
+
                                 return recur
                             }
                         }
@@ -1022,11 +1036,14 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
                 return expr
 
             case ref_local_t:
-                var := expr.(ref_local_t)
+                _var: expr_t= expr^
+                var := _var.(ref_local_t)
+                // fmt.eprintln("resolving: ",uintptr(var))
                 #partial switch type in var.expr {
                     case ref_local_t:
                         return __resolve_expr(parser, var.expr)
                     case:
+                        // fmt.eprintln("here")
                         return expr
                 }
             
@@ -1357,25 +1374,25 @@ naive_ir :: proc(parser: ^parser_t) -> []ir_instruction_t {
             // fmt.eprintln("symbol is ", ref^)
         }
     }
-
-
+    
     var_counter : u32 = 0; 
     label_counter: u32 = 0;
     nodes: =make([dynamic]ir_value_t)
     
     state := ir_state_t{
+        ir_buf=new([dynamic]ir_instruction_t),
         label_counter=&label_counter,
         var_counter=&var_counter,
         nodes=&nodes,
-        locals_stack=parser.locals_stack,
-        locals=new(map[ref_local_t]ir_varname_t),
+        
         global_values=new(map[identifier_t]ir_value_t),
         track_versions=new(map[ir_varname_t]u32),
-        ir_buf=new([dynamic]ir_instruction_t),
         branching_active=new(u32),
         is_main_br = new(bool),
+        // TODO(yousef): reset "stack" after calling combine()
         branching = new(map[u32] [dynamic]branch_entry_t),
-        br_stack=new([dynamic]u32)
+        br_stack=new([dynamic]u32),
+        locals = new(map[ref_local_t]ir_varname_t)
     }
     ir_buf := state.ir_buf;
     
@@ -1383,6 +1400,7 @@ naive_ir :: proc(parser: ^parser_t) -> []ir_instruction_t {
     for name, some_int in parser.int_pool{
         transform_int_literal(name, some_int, state, ir_buf)
     }
+    
 
     for name, info in parser.function_pool{
         transform_function(name, info, state, ir_buf)
@@ -1436,12 +1454,15 @@ transform_int_literal :: proc(varname: identifier_t, some_int: int_literal_t, st
 }
 
 transform_function :: proc(name: identifier_t, function: func_info_t, state: ir_state_t, ir_buf: ^[dynamic]ir_instruction_t){
+    
+    // fmt.eprintln(function.body)
     transform_stmt(function.body, state, ir_buf)
 }
 
 transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_instruction_t) {
     switch type in stmt{
         case return_t: {
+            // fmt.eprintln("working return: ")
             val := transform_expr(stmt.(return_t).inner, state, ir_buf)
             append(ir_buf, ir_emit_t {value=val })
         }
@@ -1453,15 +1474,16 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
         }
 
         case vdecl_stmt_t:
-            var := stmt.(vdecl_stmt_t).is 
+            var := stmt.(vdecl_stmt_t).is
             
             src := transform_expr(var.expr, state, ir_buf)
 
             dest := get_next_var(state)
             ir_copy(dest.name, src, state)
-            
+            // fmt.eprintln("inserting ", uintptr(var), " -> ", dest.name)
             map_insert(state.locals, var, dest.name)
-            
+            // fmt.eprintln("after: ", state.locals)
+
         case local_const_t:
             transform_local_const(stmt.(local_const_t), state, ir_buf)
         
@@ -1604,14 +1626,14 @@ ir_state_t :: struct{
     label_counter: ^u32,
     nodes: ^[dynamic]ir_value_t,
     locals_stack: []local_t,
-    locals: ^map[ref_local_t]ir_varname_t,
     global_values: ^map[identifier_t]ir_value_t,
     track_versions: ^map[ir_varname_t]u32,
     ir_buf: ^[dynamic]ir_instruction_t,
     branching_active: ^u32,
     is_main_br: ^bool,
     branching: ^map[u32][dynamic]branch_entry_t,
-    br_stack: ^[dynamic]u32
+    br_stack: ^[dynamic]u32,
+    locals: ^map[ref_local_t]ir_varname_t,
 }
 
 branch_entry_t :: struct{name: ir_varname_t, from: u32, to: u32}
@@ -1628,7 +1650,8 @@ latest_valid :: proc(state: ir_state_t, varname: ir_varname_t) -> ir_var_t{
 transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_instruction_t) -> ir_value_t {
     var_counter := state.var_counter;
     label_counter := state.label_counter
-    #partial switch type in expr{
+    expr_ := expr^
+    #partial switch type in expr_{
         case int_literal_t: {
             return expr.(int_literal_t)
         }
@@ -1690,11 +1713,13 @@ transform_expr :: proc(expr: ^expr_t, state: ir_state_t,  ir_buf: ^[dynamic]ir_i
         }
 
         case ref_local_t:
-            varname := state.locals[expr.(ref_local_t)]
-            vers := latest_valid(state, varname).ver
-            return ir_var_t{
-                name=varname, ver=vers
-            }
+            // fmt.eprintln("received", state.locals)
+            _, var, _, err := map_entry(state.locals, expr_.(ref_local_t))
+            
+            varname := var^
+            // fmt.eprintln("found: ", uintptr(expr_.(ref_local_t)), "=>", varname) 
+
+            return latest_valid(state, varname)
 
         case identifier_t:
             return state.global_values[expr.(identifier_t)]
