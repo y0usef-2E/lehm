@@ -1461,7 +1461,8 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
         case exprstmt_t:
             transform_expr(stmt.(exprstmt_t).inner, state, ir_buf)
 
-        case if_stmt_t:
+        case if_stmt_t:{
+            is_main :=state.is_main_br^ 
             _if := stmt.(if_stmt_t)
 
             res_var := get_next_var(state)
@@ -1487,7 +1488,10 @@ transform_stmt :: proc(stmt: stmt_t, state: ir_state_t, ir_buf: ^[dynamic]ir_ins
             transform_stmt(_if.otherwise^, state, ir_buf)
 
             emit_label(combine, ir_buf)
+            state.is_main_br^ = is_main
             begin_combine(state)
+        }
+            
         case empty_stmt_t:
             return 
 
@@ -1520,7 +1524,6 @@ begin_altbr :: proc(state: ir_state_t) {
 
 begin_combine :: proc(state: ir_state_t){
     state.branching_active^ -=1
-    state.is_main_br^= true
     combine_id := pop(state.br_stack)
     
     ir_buf := state.ir_buf
@@ -1721,13 +1724,16 @@ format_value :: proc(sbuilder: ^strings.Builder, val: ir_value_t){
             fmt.sbprint(sbuilder, "phony(")
             phi := val.(ir_phony_t)
 
-            for i in phi.fro..=phi.to{
+            /* for i in phi.fro..=phi.to{
                 fmt.sbprintf(sbuilder, "tmp%d.%d", phi.src, i)
                 
                 if i != phi.to{
                     fmt.sbprint(sbuilder, ", ")
                 }
             }
+            */
+            fmt.sbprintf(sbuilder, "tmp%d.%d, ", phi.src, phi.fro)
+            fmt.sbprintf(sbuilder, "tmp%d.%d", phi.src, phi.to)
             fmt.sbprint(sbuilder, ")")
     }
 }
