@@ -147,7 +147,11 @@ main :: proc(){
         }
     }
 
-    naive_ir(&parser, all_stmts)
+    ir_buf := naive_ir(&parser, all_stmts)
+    
+    str := format_ir_buffer(ir_buf)
+
+    fmt.println(str)
 }
 
 init_precedence :: proc(parser: ^parser_t){
@@ -540,7 +544,7 @@ parser_t :: struct {
     ptable: [32]u8,
 
     global_symbols: map[identifier_t]bool,
-    int_pool: map[identifier_t]int_literal_t,
+    immutable_int_vars: map[identifier_t]int_literal_t,
     function_pool: map[identifier_t]func_info_t,
 
     scope: u16,
@@ -769,7 +773,7 @@ global_symbol :: proc(parser: ^parser_t, name: identifier_t){
 }
 
 parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
-    varname: identifier_t;
+    ident: identifier_t;
     typename: identifier_t;
 
     current := parser.tokens[parser.position]
@@ -804,7 +808,7 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
 
     #partial switch token in current {
         case identifier_t: {
-            varname = token
+            ident = token
             if peek_token(parser, simple_token_t.COLON, 1){
                 parser.position+=2;
                 if consume_token(parser, simple_token_t.COLON){
@@ -817,15 +821,14 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                     }
                     
                     if parser.scope == 0{
-                        
                         #partial switch kind in rhs{
                             case int_literal_t:
-                                map_insert(&parser.global_symbols, varname, true)
-                                map_insert(&parser.int_pool, varname, rhs.(int_literal_t))
+                                global_symbol(parser, ident)
+                                map_insert(&parser.immutable_int_vars, ident, rhs.(int_literal_t))
                             case func_info_t:
                                 // allocating for now
-                                map_insert(&parser.global_symbols, varname, false)
-                                map_insert(&parser.function_pool, varname, rhs.(func_info_t))
+                                global_symbol(parser, ident)
+                                map_insert(&parser.function_pool, ident, rhs.(func_info_t))
                             case:
                                 panic("unimplemented constant expression")
                         }
@@ -833,7 +836,7 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                         return empty_stmt_t{}
                     }else{
                         ref := push_local(parser, local_t{
-                            is_var=false, name=varname, id=next_var_id(parser), expr=boxed_node(parser, rhs)
+                            is_var=false, name=ident, id=next_var_id(parser), expr=boxed_node(parser, rhs)
                         })
                         return local_const_t(local_const_t{ref})
                     }
@@ -859,7 +862,7 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                     }
                     
                     at := push_local(parser, local_t{
-                        is_var=true, name=varname, id=next_var_id(parser), expr=boxed_node(parser, rhs)
+                        is_var=true, name=ident, id=next_var_id(parser), expr=boxed_node(parser, rhs)
                     })
                     // fmt.eprintln(at)
 
@@ -1328,32 +1331,37 @@ ir_varname_t :: distinct u32
 
 ir_var_t :: struct {name: ir_varname_t, ver: u32};
 
-ir_value_t :: union{ir_var_t, int_literal_t, ir_phony_t}
+ir_global_symbol :: distinct identifier_t
+
+ir_value_t :: union{ir_var_t, ir_global_symbol, int_literal_t, ir_phony_t}
 
 ir_binary_t :: struct {op: binop_t, left: ir_value_t, right: ir_value_t, dest: ir_var_t}
 
 ir_unary_t :: struct{op: unop_t, src: ir_value_t, dest: ir_var_t}
 
-ir_emit_t :: struct{value: ir_value_t}
+ir_return_t :: struct{value: ir_value_t}
 
-label_t :: struct{id: u32, name: string}
+ir_label_t :: struct{id: u32, name: string}
 
-ir_jump_label_t :: struct{to: label_t}
+ir_jump_label_t :: struct{to: ir_label_t}
 
-ir_jz_label_t :: struct{test: ir_value_t, to: label_t}
+ir_jz_label_t :: struct{test: ir_value_t, to: ir_label_t}
 
-ir_label_at_t :: struct{is: label_t}
+ir_emit_label_t :: struct{is: ir_label_t}
+
+ir_define_gconst_t :: struct{dest: ir_global_symbol, constant: int_literal_t}
 
 ir_copy_t :: struct{dest: ir_var_t, src:ir_value_t}
 
 ir_instruction_t :: union{
     ir_unary_t,
     ir_binary_t,
-    ir_emit_t,
+    ir_return_t,
     ir_jump_label_t,
     ir_jz_label_t, 
-    ir_label_at_t,
-    ir_copy_t
+    ir_emit_label_t,
+    ir_copy_t,
+    ir_define_gconst_t
 }
 
 ir_phony_t :: struct{
@@ -1368,16 +1376,16 @@ ir_state_t :: struct{
     var_counter: u32, 
     label_counter: u32,
 
-    global_values: map[identifier_t]ir_value_t,
-    track_versions: ^map[ir_varname_t]u32,
+    // global_values: map[identifier_t]ir_globconst_t,
+    track_versions: map[ir_varname_t]u32,
     
-    locals: ^map[ref_local_t]ir_varname_t,
+    locals: map[ref_local_t]ir_varname_t,
 
     br_ids_st: [dynamic]u32,
     br_active: u32,
     br_is_main: bool,
-    br_table: ^map[u32][dynamic]branch_entry_t,
-    br_temp: ^map[ir_varname_t]u32
+    br_table: map[u32][dynamic]branch_entry_t,
+    br_temp: map[ir_varname_t]u32
 }
 
 branch_entry_t :: struct{name: ir_varname_t, from: u32, to: u32}
@@ -1388,20 +1396,20 @@ naive_ir :: proc(parser: ^parser_t, list: [dynamic]stmt_t) -> []ir_instruction_t
         ir_buf=make([dynamic]ir_instruction_t),
         label_counter=0,
         var_counter=0,
-        global_values=new(map[identifier_t]ir_value_t)^,
+        // global_values=new(map[identifier_t]ir_globconst_t)^,
 
-        locals = new(map[ref_local_t]ir_varname_t),
+        locals = new(map[ref_local_t]ir_varname_t)^,
     
-        track_versions=new(map[ir_varname_t]u32),
+        track_versions=new(map[ir_varname_t]u32)^,
 
         br_active=0,
         br_is_main = false,
         // TODO(yousef): reset "stack" after calling combine()
-        br_table = new(map[u32] [dynamic]branch_entry_t),
+        br_table = new(map[u32] [dynamic]branch_entry_t)^,
         br_ids_st=make([dynamic]u32),
     }
 
-    for name, some_int in parser.int_pool{
+    for name, some_int in parser.immutable_int_vars{
         transform_global_int_const(name, some_int, &state)
     }
     
@@ -1410,10 +1418,6 @@ naive_ir :: proc(parser: ^parser_t, list: [dynamic]stmt_t) -> []ir_instruction_t
         transform_function(name, info, &state)
     }
 
-    str := format_ir_buffer(state.ir_buf[:])
-
-    fmt.println(str)
-    
     return state.ir_buf[:len(state.ir_buf)];
 }
 
@@ -1424,16 +1428,20 @@ transform_local_const :: proc(local: local_const_t, state: ^ir_state_t){
     dest := get_next_var(state)    
     ir_copy(dest.name, src, state)
     
-    map_insert(state.locals, local.ref, dest.name)
+    map_insert(&state.locals, local.ref, dest.name)
+}
+
+make_const :: proc(const: ir_global_symbol, value: int_literal_t, state: ^ir_state_t){
+    append(&state.ir_buf, ir_define_gconst_t{
+        const, value
+    })
 }
 
 // FIXME(yousef): rework this
 transform_global_int_const :: proc(varname: identifier_t, some_int: int_literal_t, state: ^ir_state_t){
-    dest := get_next_var(state)
+    make_const(ir_global_symbol(varname), some_int, state)
     
-    ir_copy(dest.name, some_int, state)
-    
-    map_insert(&state.global_values, varname, dest)
+    // map_insert(&state.global_values, varname, dest)
 }
 
 transform_function :: proc(name: identifier_t, function: func_info_t, state: ^ir_state_t){
@@ -1448,7 +1456,7 @@ transform_stmt :: proc(stmt: stmt_t, state: ^ir_state_t) {
         case return_t: {
             // fmt.eprintln("working return: ")
             val := transform_expr(stmt.(return_t).inner, state)
-            append(ir_buf, ir_emit_t {value=val })
+            append(ir_buf, ir_return_t {value=val })
         }
 
         case block_t:{
@@ -1465,7 +1473,7 @@ transform_stmt :: proc(stmt: stmt_t, state: ^ir_state_t) {
             dest := get_next_var(state)
             ir_copy(dest.name, src, state)
             // fmt.eprintln("inserting ", uintptr(var), " -> ", dest.name)
-            map_insert(state.locals, var, dest.name)
+            map_insert(&state.locals, var, dest.name)
             // fmt.eprintln("after: ", state.locals)
 
         case local_const_t:
@@ -1591,7 +1599,8 @@ transform_expr :: proc(expr: ^expr_t, state: ^ir_state_t) -> ir_value_t {
             
 
         case identifier_t:
-            return state.global_values[expr.(identifier_t)]
+            // TODO(yousef): not every 
+            return ir_global_symbol(expr.(identifier_t))
         
         case assign_t:
             assignment := expr.(assign_t)
@@ -1602,7 +1611,7 @@ transform_expr :: proc(expr: ^expr_t, state: ^ir_state_t) -> ir_value_t {
             right := transform_expr(assignment.right, state)
             
             ir_copy(varname, right, state)
-            map_insert(state.locals, var_ref, varname)
+            map_insert(&state.locals, var_ref, varname)
             dest := latest_valid(state, varname)
             return dest
 
@@ -1615,7 +1624,7 @@ transform_expr :: proc(expr: ^expr_t, state: ^ir_state_t) -> ir_value_t {
     }
 }
 
-begin_mainbr :: proc(state: ^ir_state_t) ->label_t {
+begin_mainbr :: proc(state: ^ir_state_t) ->ir_label_t {
     combine := get_next_label(state, "combine")
     append(&state.br_ids_st, combine.id)
     
@@ -1657,7 +1666,7 @@ begin_combine :: proc(state: ^ir_state_t){
         }
     }
     
-    clear_map(state.br_temp)
+    clear_map(&state.br_temp)
 }
 
 // FIXME(yousef): here temporarily increment version, but commit it only in combine()
@@ -1670,7 +1679,7 @@ ir_copy :: proc (dest_name: ir_varname_t, src: ir_value_t, state: ^ir_state_t){
             dest=dest, src=src
     }
 
-    map_insert(state.track_versions, dest.name, dest.ver+1)
+    map_insert(&state.track_versions, dest.name, dest.ver+1)
 
     append(&state.ir_buf, copy)
 
@@ -1701,14 +1710,14 @@ ir_copy :: proc (dest_name: ir_varname_t, src: ir_value_t, state: ^ir_state_t){
     }
 }
 
-emit_label :: proc(label: label_t, ir_buf: ^[dynamic]ir_instruction_t){
-    instr := ir_label_at_t{is=label}
+emit_label :: proc(label: ir_label_t, ir_buf: ^[dynamic]ir_instruction_t){
+    instr := ir_emit_label_t{is=label}
     append(ir_buf, instr)
 }
 
 get_next_var :: proc(state: ^ir_state_t)->ir_var_t{
     new_var := ir_varname_t(state^.var_counter)
-    map_insert(state.track_versions, new_var, 0)
+    map_insert(&state.track_versions, new_var, 0)
     var := ir_var_t{name=new_var, ver=0 }
     state^.var_counter+=1
     return var
@@ -1716,10 +1725,16 @@ get_next_var :: proc(state: ^ir_state_t)->ir_var_t{
 
 get_next_varname :: proc(state: ^ir_state_t)->ir_varname_t{
     new_name := ir_varname_t(state.var_counter)
-    map_insert(state.track_versions, new_name, 0)
+    map_insert(&state.track_versions, new_name, 0)
     state^.var_counter+=1
     return new_name
 }
+
+// get_next_globconst :: proc(state: ^ir_state_t)->ir_globconst_t{
+//     return {
+//         get_next_varname(state)
+//     }
+// }
 
 // NOTE(yousef): this is to replace the pattern:
 // state.track_versions[varname]-1 because it is error-prone
@@ -1729,9 +1744,9 @@ latest_valid :: proc(state: ^ir_state_t, varname: ir_varname_t) -> ir_var_t{
     }
 }
 
-get_next_label :: proc(state: ^ir_state_t, name: string) -> label_t{
+get_next_label :: proc(state: ^ir_state_t, name: string) -> ir_label_t{
     state^.label_counter+=1;
-    return label_t{
+    return ir_label_t{
         id=state.label_counter-1,
         name=name
     }
@@ -1747,9 +1762,13 @@ format_value :: proc(sbuilder: ^strings.Builder, val: ir_value_t){
         case ir_var_t:{           
             fmt.sbprintf(sbuilder, "tmp%d.%d", val.(ir_var_t).name, val.(ir_var_t).ver)    
         }
+
+        case ir_global_symbol:{
+            fmt.sbprintf(sbuilder, "GLOB(\"%s\")", val.(ir_global_symbol))    
+        }
     
         case int_literal_t:{
-            fmt.sbprintf(sbuilder, "CONST(%d)", val.(int_literal_t))
+            fmt.sbprintf(sbuilder, "LIT(%d)", val.(int_literal_t))
         }
         case ir_phony_t:
             fmt.sbprint(sbuilder, "phony(")
@@ -1775,9 +1794,9 @@ format_ir_buffer :: proc(ir_buf: []ir_instruction_t) -> string{
     fmt.sbprint(&string_builder, "\n")
     for instruction in ir_buf {
         switch type in instruction{
-            case ir_emit_t:{
+            case ir_return_t:{
                 fmt.sbprint(&string_builder, "EMIT ")
-                format_value(&string_builder, instruction.(ir_emit_t).value);
+                format_value(&string_builder, instruction.(ir_return_t).value);
                 fmt.sbprint(&string_builder, "\n")
             }
             case ir_binary_t:{
@@ -1810,8 +1829,8 @@ format_ir_buffer :: proc(ir_buf: []ir_instruction_t) -> string{
                 fmt.sbprint(&string_builder, "\n")
             }
 
-            case ir_label_at_t:{
-                is := instruction.(ir_label_at_t).is
+            case ir_emit_label_t:{
+                is := instruction.(ir_emit_label_t).is
                 fmt.sbprintf(&string_builder, "\n@%d.%s:\n", is.id, is.name)
             }
             case ir_copy_t: {
@@ -1821,6 +1840,15 @@ format_ir_buffer :: proc(ir_buf: []ir_instruction_t) -> string{
                 format_value(&string_builder, copy.src)
                 fmt.sbprint(&string_builder, "\n")
             }
+
+            case ir_define_gconst_t:{
+                gc := instruction.(ir_define_gconst_t)
+                format_value(&string_builder, gc.dest)
+                fmt.sbprint(&string_builder, " = ")    
+                format_value(&string_builder, gc.constant)
+                fmt.sbprint(&string_builder, "\n")
+            }
+
             case ir_unary_t:{
                 panic("unimplemented");
             }
