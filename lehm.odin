@@ -615,6 +615,7 @@ expr_t :: union {
     proto_t,
     enum_info_t,
     ref_local_t,
+    func_call_t
 }
 
 assign_t :: struct{
@@ -635,6 +636,11 @@ proto_t :: struct{
 func_info_t :: struct{
     proto: proto_t,
     body: block_t
+}
+
+func_call_t :: struct{
+    name: identifier_t,
+    args: []expr_t
 }
 
 enum_info_t :: struct{}
@@ -971,7 +977,7 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
             return logexpr
     }
 
-    __resolve_expr :: proc(parser: ^parser_t, expr: ^expr_t) -> ^expr_t  {
+    __resolve_expr :: proc(parser: ^parser_t, expr: expr_t) -> expr_t  {
         switch kind in expr{
             case identifier_t:{
                 ident := expr.(identifier_t)
@@ -988,12 +994,10 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
                             
                             if local.name == ident{
                                 // fmt.println("resolving: ", ident)
-                                expr^= parser.locals_stack[j]
-                                // fmt.println("is: ", expr^)
-                                recur := __resolve_expr(parser, expr)
-                                // fmt.println("is actually: ", recur^)
+                                neu: expr_t = parser.locals_stack[j]
+                                // fmt.println("is: ", expr)
 
-                                return recur
+                                return neu
                             }
                         }
                     }
@@ -1008,32 +1012,30 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
 
             case if_expr_t:
                 _if := expr.(if_expr_t)
-                _if.cond = __resolve_expr(parser, _if.cond)
-                _if.then = __resolve_expr(parser, _if.then)
-                _if.otherwise  = __resolve_expr(parser, _if.otherwise)
-                expr^ = _if
-                return expr
+                _if.cond^ = __resolve_expr(parser, _if.cond^)
+                _if.then^ = __resolve_expr(parser, _if.then^)
+                _if.otherwise^  = __resolve_expr(parser, _if.otherwise^)
+                return _if
 
             case assign_t:
                 _a := expr.(assign_t)
-                _a.right = __resolve_expr(parser, _a.right)
-                _a.left = __resolve_expr(parser, _a.left)
-                
-                expr^ = _a 
-                return expr
+                _a.right^ = __resolve_expr(parser, _a.right^)
+                _a.left^ = __resolve_expr(parser, _a.left^)
+            
+                return _a
 
             case binexpr_t:
                 _b := expr.(binexpr_t)
-                _b.left = __resolve_expr(parser, _b.left)
-                _b.right = __resolve_expr(parser, _b.right)
-                expr^ = _b 
-                return expr 
+                _b.left^ = __resolve_expr(parser, _b.left^)
+                _b.right^ = __resolve_expr(parser, _b.right^)
+                
+                return _b
 
             case unexpr_t:
                 _u := expr.(unexpr_t)
-                _u.inner = __resolve_expr(parser, _u.inner)
-                expr^ = _u 
-                return expr
+                _u.inner^ = __resolve_expr(parser, _u.inner^)
+                
+                return _u
 
             case int_literal_t, char_literal_t, float_literal_t, string_literal_t:
                 return expr
@@ -1046,16 +1048,17 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
                 return expr
 
             case ref_local_t:
-                _var: expr_t= expr^
-                var := _var.(ref_local_t)
-                // fmt.eprintln("resolving: ",uintptr(var))
-                #partial switch type in var.expr {
-                    case ref_local_t:
-                        return __resolve_expr(parser, var.expr)
-                    case:
-                        // fmt.eprintln("here")
-                        return expr
+                return expr
+            
+            case func_call_t:
+                invoc := expr.(func_call_t)
+                args := invoc.args
+                for i in 0..<len(args){
+                    some_arg := &args[i]
+                    args[i] = __resolve_expr(parser, some_arg^)
                 }
+
+                panic("unimplemented")
             
         }
         return nil
@@ -1063,7 +1066,7 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
 
     expr := __parse_expr(parser)
     
-    __resolve_expr(parser, &expr)
+    expr = __resolve_expr(parser, expr)
 
     return expr
 }
@@ -1097,6 +1100,10 @@ DEF_MINPREC :u8 : 0
 
 advance :: proc(parser: ^parser_t){
     parser.position+=1;
+}
+
+current :: proc(parser: ^parser_t) -> token_t{
+    return parser.tokens[parser.position]
 }
 
 parse_logexpr :: proc(parser: ^parser_t, min_prec: u8) -> expr_t{
@@ -1211,6 +1218,31 @@ parse_prim :: proc(parser: ^parser_t) -> expr_t{
             return token
         case identifier_t:
             advance(parser)
+            if consume_token(parser, simple_token_t.LEFT_PAREN){
+                expr: expr_t;
+                args := make([dynamic]expr_t)
+
+                for {
+                    expr = parse_resolve_expr(parser)
+                    
+                    // TODO(yousef): better error handling
+                    assert(expr != nil)
+
+                    append(&args, expr)
+                    if !consume_token(parser, simple_token_t.COMMA){
+                        if consume_token(parser, simple_token_t.RIGHT_PAREN){
+                            break;  
+                        }else{
+                            fmt.eprintln("expected `(` found: ", current(parser))
+                        }
+                    }
+                }
+
+                return func_call_t{
+                    name=token,
+                    args=args[:len(args)]
+                }
+            }
             return token
     }
     
