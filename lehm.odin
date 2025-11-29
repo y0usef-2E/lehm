@@ -108,8 +108,9 @@ main :: proc(){
     test2 := "0b111"
     assert(parse_binary_literal(transmute([]u8)test2) == 7)
 
-    handle, err := os.open("./tests/one.lh")
+    handle, err := os.open("tests/two.lh")
     if err != nil{
+        fmt.eprintln(err);
         panic("cannot find file"); 
     }
     bytes: [4096 * 4]u8 = {};
@@ -832,7 +833,7 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                                 global_symbol(parser, ident)
                                 map_insert(&parser.immutable_int_vars, ident, rhs.(int_literal_t))
                             case func_info_t:
-                                // allocating for now
+                                // FIXME(yousef): allocating for now
                                 global_symbol(parser, ident)
                                 map_insert(&parser.function_pool, ident, rhs.(func_info_t))
                             case:
@@ -903,7 +904,7 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                     }
                     then_body := parse_stmt(parser)
                     
-                    // ALLOCATING FOR NOW
+                    // FIXME(yousef): ALLOCATING FOR NOW
                     current_if := if_stmt_t{
                         cond=boxed_node(parser, cond),
                         then=new_clone(then_body.(block_t)),
@@ -1396,32 +1397,71 @@ ir_instruction_t :: union{
     ir_define_gconst_t
 }
 
-ir_phony_t :: struct{
-    src: ir_varname_t,
-    fro: u32,
-    to: u32
+ir_phony_t :: struct{}
+
+branch_mutation_t :: distinct [2]u32;
+/*
+branch_mutation_t :: struct{
+    [0] altbr: u32,    
+    [1] mainbr: u32, // zero is uninitialised
+    
 }
+*/
 
 ir_state_t :: struct{
     ir_buf: [dynamic]ir_instruction_t,
 
-    var_counter: u32, 
+    var_counter: u32,
+    temp_counter: u32,
     label_counter: u32,
 
     // global_values: map[identifier_t]ir_globconst_t,
-    track_versions: map[ir_varname_t]u32,
     
     locals: map[ref_local_t]ir_varname_t,
 
-    br_ids_st: [dynamic]u32,
-    br_active: u32,
+    branch_depth: u32,
     br_is_main: bool,
-    br_table: map[u32][dynamic]branch_entry_t,
-    br_temp: map[ir_varname_t]u32
+    br_stack: [256]bool,
+    mutation_ledger: ^map[ir_varname_t][256]branch_mutation_t,
+    mutated_vars: ^map[ref_local_t]bool,
+
+    /*
+        mutation ledger: 
+        1) 
+        refer to var in MAIN BRANCH: 
+        lookup: ledger[var] => struct {mainbr_state | altbr_state}
+        if mainbr_state != 0 { 
+            correct reference is latest(branch_factor, var, mainbr)
+        }else{
+            correct reference is super(var) 
+        }
+
+        2) 
+        mutate var in MAIN BRANCH: 
+        lookup: ledger[var] => struct{} 
+        mark var as mutated in current br_factor 
+
+        if mainbr_state != 0 { 
+            v_x :: latest(branch_factor, var, mainbr)
+            
+            emit copy: v_x <= new_value 
+            ledger[var].main = v_x; 
+        }else{
+            correct reference is super(var) 
+            v_y :: new_temp(branch_factor, var, mainbr)
+            emit copy v_y <= new_value 
+            ledger[var].main = v_y; 
+        }
+
+        in combine:         
+        for each VARIABLE in mutated(br_factor)
+            emit phi_copy NEXT(VARIABLE) <= phi_double {
+                MAIN = main_br_state(br_factor) == 0? CURRENT(VARIABLE) : main_br_state,
+                ALTER = alt_br_state(br_factor) == 0? CURRENT(VARIABLE) : alt_br_state,
+            }
+            mark VARIABLE mutation as false
+    */
 }
-
-branch_entry_t :: struct{name: ir_varname_t, from: u32, to: u32}
-
 
 naive_ir :: proc(parser: ^parser_t, list: [dynamic]stmt_t) -> []ir_instruction_t {
     state := ir_state_t{
@@ -1432,13 +1472,10 @@ naive_ir :: proc(parser: ^parser_t, list: [dynamic]stmt_t) -> []ir_instruction_t
 
         locals = new(map[ref_local_t]ir_varname_t)^,
     
-        track_versions=new(map[ir_varname_t]u32)^,
-
-        br_active=0,
-        br_is_main = false,
-        // TODO(yousef): reset "stack" after calling combine()
-        br_table = new(map[u32] [dynamic]branch_entry_t)^,
-        br_ids_st=make([dynamic]u32),
+        branch_depth=0,
+        br_is_main=false,
+        mutation_ledger=new(map[ir_varname_t][256]branch_mutation_t),
+        mutated_vars=new(map[ref_local_t]bool)
     }
 
     for name, some_int in parser.immutable_int_vars{
@@ -1455,12 +1492,15 @@ naive_ir :: proc(parser: ^parser_t, list: [dynamic]stmt_t) -> []ir_instruction_t
 
 
 transform_local_const :: proc(local: local_const_t, state: ^ir_state_t){
+    panic("unimplemented")
+    /*
     src := transform_expr(local.ref.expr, state)
     
     dest := get_next_var(state)    
     ir_copy(dest.name, src, state)
     
     map_insert(&state.locals, local.ref, dest.name)
+    */
 }
 
 make_const :: proc(const: ir_global_symbol, value: int_literal_t, state: ^ir_state_t){
@@ -1472,13 +1512,10 @@ make_const :: proc(const: ir_global_symbol, value: int_literal_t, state: ^ir_sta
 // FIXME(yousef): rework this
 transform_global_int_const :: proc(varname: identifier_t, some_int: int_literal_t, state: ^ir_state_t){
     make_const(ir_global_symbol(varname), some_int, state)
-    
     // map_insert(&state.global_values, varname, dest)
 }
 
 transform_function :: proc(name: identifier_t, function: func_info_t, state: ^ir_state_t){
-    
-    // fmt.eprintln(function.body)
     transform_stmt(function.body, state)
 }
 
@@ -1497,17 +1534,18 @@ transform_stmt :: proc(stmt: stmt_t, state: ^ir_state_t) {
             }
         }
 
-        case vdecl_stmt_t:
+        case vdecl_stmt_t:{
             var := stmt.(vdecl_stmt_t).is
-            
+            dest_name := get_next_varname(state)
+            dest := ir_var_t{dest_name, 1}
             src := transform_expr(var.expr, state)
-
-            dest := get_next_var(state)
-            ir_copy(dest.name, src, state)
-            // fmt.eprintln("inserting ", uintptr(var), " -> ", dest.name)
+            append(ir_buf, ir_copy_t{dest=dest, src=src})
             map_insert(&state.locals, var, dest.name)
-            // fmt.eprintln("after: ", state.locals)
-
+            // FIXME(yousef): think about your life choices
+            arr := [256]branch_mutation_t{}
+            arr[state.branch_depth][cast(u8)state.br_is_main] = 1;
+            map_insert(state.mutation_ledger, dest.name, arr);
+        }
         case local_const_t:
             transform_local_const(stmt.(local_const_t), state)
         
@@ -1515,11 +1553,14 @@ transform_stmt :: proc(stmt: stmt_t, state: ^ir_state_t) {
             transform_expr(stmt.(exprstmt_t).inner, state)
 
         case if_stmt_t:{
-            is_main := state.br_is_main 
+            state.br_stack[state.branch_depth] = state.br_is_main;
+            state^.branch_depth = state^.branch_depth + 1;
+            
             _if := stmt.(if_stmt_t)
 
             _else := get_next_label(state, "else")
-            combine := begin_mainbr(state)
+            combine := get_next_label(state, "combine")
+            // here: begin_mainbr() 
             
             cond := transform_expr(_if.cond, state)
             jump_if_false := ir_jz_label_t{
@@ -1533,15 +1574,21 @@ transform_stmt :: proc(stmt: stmt_t, state: ^ir_state_t) {
             }
             append(ir_buf, jump_combine)
 
-            emit_label(_else, ir_buf)
-            begin_altbr(state)
-            transform_stmt(_if.otherwise^, state)
+            if _if.otherwise != nil {
+                emit_label(_else, ir_buf)
+                // here: begin_altbr() 
 
+                transform_stmt(_if.otherwise^, state)
+            }
+            
             emit_label(combine, ir_buf)
             
-            state^.br_is_main = is_main
+            // restore old value
+            state^.br_is_main = state.br_stack[state.branch_depth - 1]
             
-            begin_combine(state)
+            // here: begin_combine() 
+
+            state^.branch_depth = state^.branch_depth - 1;
         }
             
         case empty_stmt_t:
@@ -1556,6 +1603,28 @@ transform_stmt :: proc(stmt: stmt_t, state: ^ir_state_t) {
     }
 }
 
+SUPER :: proc(varname: ir_varname_t, br_depth:u32, state: ^ir_state_t) -> ir_var_t{
+    depth := br_depth - 1; 
+    for true {
+        is_main := state.br_stack[depth];
+        index := cast(u8) is_main; 
+        version := state.mutation_ledger[varname][state.branch_depth][index]
+        // NOTE(yousef): assumes that whenever a branch is terminated, this occurs:
+        // ledger[var][br_factor] <- {[0] = 0 , [1] = 0}
+        // THIS SHOULD ALWAYS BE TRUE
+
+        if version != 0{
+            return ir_var_t{name=varname, ver=version}
+        }
+        if depth == 0{
+            break;
+        }else{
+            depth-=1;
+        }
+    }
+    panic("[FATAL] variable not found in ledger.")
+}
+
 transform_expr :: proc(expr: ^expr_t, state: ^ir_state_t) -> ir_value_t {
     ir_buf := &state.ir_buf
 
@@ -1568,7 +1637,7 @@ transform_expr :: proc(expr: ^expr_t, state: ^ir_state_t) -> ir_value_t {
             this :=expr.(binexpr_t); 
             
             src_left := transform_expr(this.left, state);
-            dest := get_next_var(state)
+            dest := ir_var_t {get_next_varname(state), 1};
 
             src_right := transform_expr(this.right, state);
             instruction : ir_instruction_t = ir_binary_t{
@@ -1582,56 +1651,29 @@ transform_expr :: proc(expr: ^expr_t, state: ^ir_state_t) -> ir_value_t {
             return dest
         }
 
-        case if_expr_t:{
-            is_main := state.br_is_main
-            this := expr.(if_expr_t)
-            
-            res_varname := get_next_varname(state)
+        case if_expr_t:
+            panic("unimplemented");
 
-            false_label := get_next_label(state, "false")
-            combine := begin_mainbr(state)
-            
-            
-            cond := transform_expr(this.cond, state)
-            jz := ir_jz_label_t{
-                test=cond, to=false_label
-            }
-            append(ir_buf, jz)
+        case ref_local_t:{
+            varname := state.locals[expr.(ref_local_t)];
+            ledger := state.mutation_ledger;
+            index := cast(u8) state.br_is_main;
+            version := ledger[varname][state.branch_depth][index];
+            if 0 == version {
+                // this should never happen
+                assert(state.branch_depth != 0);
 
-
-            then := transform_expr(this.then, state)
-            ir_copy(res_varname, then, state)
-            j := ir_jump_label_t {
-                to=combine
-            }
-            append(ir_buf, j)
-            
-
-            emit_label(false_label, ir_buf)
-            begin_altbr(state)
-            otherwise := transform_expr(this.otherwise, state)
-            ir_copy(res_varname, otherwise, state)
-
-
-            emit_label(combine, ir_buf)
-            state^.br_is_main=is_main 
-            begin_combine(state)
-
-            return latest_valid(state, res_varname)
-        }
-
-        case ref_local_t:
-            varname := state.locals[expr.(ref_local_t)]
-            
-            if state.br_active > 0{
-                return latest_valid(state, varname)
+                return SUPER(varname, state.branch_depth, state)
             }else{
-                return latest_valid(state, varname)
+                return ir_var_t {
+                    name=varname,
+                    ver=version
+                };
             }
-            
-
+        }
+        
         case identifier_t:
-            // TODO(yousef): not every 
+            // TODO(yousef): check this:
             return ir_global_symbol(expr.(identifier_t))
         
         case assign_t:
@@ -1641,11 +1683,17 @@ transform_expr :: proc(expr: ^expr_t, state: ^ir_state_t) -> ir_value_t {
             varname := state.locals[var_ref]
 
             right := transform_expr(assignment.right, state)
-            
+
+            /*
             ir_copy(varname, right, state)
             map_insert(&state.locals, var_ref, varname)
             dest := latest_valid(state, varname)
-            return dest
+            */ 
+            _ = varname;
+            _ = right;
+            // assign to var
+            panic("unimplemented!")
+            
 
         case func_info_t:
             panic("unreachable: functions should not be handled as expressions in ir")
@@ -1656,108 +1704,21 @@ transform_expr :: proc(expr: ^expr_t, state: ^ir_state_t) -> ir_value_t {
     }
 }
 
-begin_mainbr :: proc(state: ^ir_state_t) ->ir_label_t {
-    combine := get_next_label(state, "combine")
-    append(&state.br_ids_st, combine.id)
-    
-    state^.br_active +=1
-    state^.br_is_main=true 
-    state.br_table[combine.id] = make_dynamic_array([dynamic]branch_entry_t)
-
-    return combine
-}
-
-// ends mainbr: 
-begin_altbr :: proc(state: ^ir_state_t) {
-    assert(state.br_active>0)
-    
-    state^.br_is_main = false
-}
-
-begin_combine :: proc(state: ^ir_state_t){
-    state^.br_active -=1
-    combine_id := pop(&state.br_ids_st)
-    
-    for entry in state.br_table[combine_id]{
-        assert(entry.from | 0xFFFF == 0xFFFF_FFFF)
-        
-        if entry.to | 0xFFFF != 0xFFFF_FFFF{       
-            src_var := ir_var_t{
-                name=entry.name, ver=entry.from&0x0000FFFF
-            }
-            ir_copy(entry.name, src_var, state)
-        }else{
-            phony := ir_phony_t{
-                fro=entry.from & 0x0000FFFF,
-                to=entry.to & 0x0000FFFF,
-                src=entry.name
-            }
-
-            ir_copy(entry.name, phony, state)
-
-        }
-    }
-    
-    clear_map(&state.br_temp)
-}
-
-// FIXME(yousef): here temporarily increment version, but commit it only in combine()
-ir_copy :: proc (dest_name: ir_varname_t, src: ir_value_t, state: ^ir_state_t){
-    ver := state.track_versions[dest_name]
-    dest := ir_var_t{
-        name= dest_name, ver =ver 
-    } 
-    copy := ir_copy_t{
-            dest=dest, src=src
-    }
-
-    map_insert(&state.track_versions, dest.name, dest.ver+1)
-
-    append(&state.ir_buf, copy)
-
-    if state.br_active>0 {
-        if state.br_is_main{
-            br_id := state.br_ids_st[len(state.br_ids_st)-1]
-            array := state.br_table[br_id]
-
-            append(&array, branch_entry_t{
-                name=dest.name, from=0xFFFF0000|dest.ver, to = 0
-            })
-            state.br_table[br_id]=array
-        }else{
-            br_id := state.br_ids_st[len(state.br_ids_st)-1]
-            array := state.br_table[br_id]
-            
-            for i in 0..<len(array){
-                entry := array[i]
-                if entry.name == dest.name{
-                    neu := entry 
-                    assert(neu.from | 0xFFFF == 0xFFFF_FFFF)
-                    neu.to = dest.ver | 0xFFFF_0000
-                    array[i]=neu
-                }
-            }
-            state.br_table[br_id]=array
-        }
-    }
-}
-
 emit_label :: proc(label: ir_label_t, ir_buf: ^[dynamic]ir_instruction_t){
     instr := ir_emit_label_t{is=label}
     append(ir_buf, instr)
 }
-
-get_next_var :: proc(state: ^ir_state_t)->ir_var_t{
+/*
+get_new_var :: proc(state: ^ir_state_t)->ir_var_t{
     new_var := ir_varname_t(state^.var_counter)
-    map_insert(&state.track_versions, new_var, 0)
-    var := ir_var_t{name=new_var, ver=0 }
+    var := ir_var_t{name=new_var, ver=1 }
+    map_insert(&state.track_versions, var.name, var.ver)
     state^.var_counter+=1
     return var
 }
-
+*/
 get_next_varname :: proc(state: ^ir_state_t)->ir_varname_t{
     new_name := ir_varname_t(state.var_counter)
-    map_insert(&state.track_versions, new_name, 0)
     state^.var_counter+=1
     return new_name
 }
@@ -1767,14 +1728,6 @@ get_next_varname :: proc(state: ^ir_state_t)->ir_varname_t{
 //         get_next_varname(state)
 //     }
 // }
-
-// NOTE(yousef): this is to replace the pattern:
-// state.track_versions[varname]-1 because it is error-prone
-latest_valid :: proc(state: ^ir_state_t, varname: ir_varname_t) -> ir_var_t{
-    return ir_var_t{
-        varname, state.track_versions[varname]-1
-    }
-}
 
 get_next_label :: proc(state: ^ir_state_t, name: string) -> ir_label_t{
     state^.label_counter+=1;
@@ -1802,10 +1755,11 @@ format_value :: proc(sbuilder: ^strings.Builder, val: ir_value_t){
         case int_literal_t:{
             fmt.sbprintf(sbuilder, "LIT(%d)", val.(int_literal_t))
         }
+
         case ir_phony_t:
             fmt.sbprint(sbuilder, "phony(")
             phi := val.(ir_phony_t)
-
+            _ = phi;
             /* for i in phi.fro..=phi.to{
                 fmt.sbprintf(sbuilder, "tmp%d.%d", phi.src, i)
                 
@@ -1814,9 +1768,12 @@ format_value :: proc(sbuilder: ^strings.Builder, val: ir_value_t){
                 }
             }
             */
+            /*
             fmt.sbprintf(sbuilder, "tmp%d.%d, ", phi.src, phi.fro)
             fmt.sbprintf(sbuilder, "tmp%d.%d", phi.src, phi.to)
+            */
             fmt.sbprint(sbuilder, ")")
+            panic("unimplemented!")
     }
 }
 
