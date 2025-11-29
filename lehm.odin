@@ -108,7 +108,7 @@ main :: proc(){
     test2 := "0b111"
     assert(parse_binary_literal(transmute([]u8)test2) == 7)
 
-    handle, err := os.open("tests/two.lh")
+    handle, err := os.open("tests/three.lh")
     if err != nil{
         fmt.eprintln(err);
         panic("cannot find file"); 
@@ -1366,7 +1366,7 @@ ir_var_t :: struct {name: ir_varname_t, ver: u32};
 
 ir_global_symbol :: distinct identifier_t
 
-ir_value_t :: union{ir_var_t, ir_global_symbol, int_literal_t, ir_phony_t}
+ir_value_t :: union{ir_var_t, ir_global_symbol, int_literal_t, ir_phony_couplet_t}
 
 ir_binary_t :: struct {op: binop_t, left: ir_value_t, right: ir_value_t, dest: ir_var_t}
 
@@ -1397,7 +1397,10 @@ ir_instruction_t :: union{
     ir_define_gconst_t
 }
 
-ir_phony_t :: struct{}
+ir_phony_couplet_t :: struct{
+    first: ir_var_t,
+    second: ir_var_t
+}
 
 branch_mutation_t :: distinct [2]u32;
 /*
@@ -1412,7 +1415,6 @@ ir_state_t :: struct{
     ir_buf: [dynamic]ir_instruction_t,
 
     var_counter: u32,
-    temp_counter: u32,
     label_counter: u32,
 
     // global_values: map[identifier_t]ir_globconst_t,
@@ -1423,7 +1425,8 @@ ir_state_t :: struct{
     br_is_main: bool,
     br_stack: [256]bool,
     mutation_ledger: ^map[ir_varname_t][256]branch_mutation_t,
-    mutated_vars: ^map[ref_local_t]bool,
+    mutated_vars: ^map[ir_varname_t]bool,
+    track_temps: [256]u32
 
     /*
         mutation ledger: 
@@ -1475,7 +1478,7 @@ naive_ir :: proc(parser: ^parser_t, list: [dynamic]stmt_t) -> []ir_instruction_t
         branch_depth=0,
         br_is_main=false,
         mutation_ledger=new(map[ir_varname_t][256]branch_mutation_t),
-        mutated_vars=new(map[ref_local_t]bool)
+        mutated_vars=new(map[ir_varname_t]bool)
     }
 
     for name, some_int in parser.immutable_int_vars{
@@ -1541,6 +1544,7 @@ transform_stmt :: proc(stmt: stmt_t, state: ^ir_state_t) {
             src := transform_expr(var.expr, state)
             append(ir_buf, ir_copy_t{dest=dest, src=src})
             map_insert(&state.locals, var, dest.name)
+
             // FIXME(yousef): think about your life choices
             arr := [256]branch_mutation_t{}
             arr[state.branch_depth][cast(u8)state.br_is_main] = 1;
@@ -1560,7 +1564,7 @@ transform_stmt :: proc(stmt: stmt_t, state: ^ir_state_t) {
 
             _else := get_next_label(state, "else")
             combine := get_next_label(state, "combine")
-            // here: begin_mainbr() 
+            state.br_is_main = true;
             
             cond := transform_expr(_if.cond, state)
             jump_if_false := ir_jz_label_t{
@@ -1576,19 +1580,59 @@ transform_stmt :: proc(stmt: stmt_t, state: ^ir_state_t) {
 
             if _if.otherwise != nil {
                 emit_label(_else, ir_buf)
-                // here: begin_altbr() 
-
+                state.br_is_main = false;
                 transform_stmt(_if.otherwise^, state)
             }
             
             emit_label(combine, ir_buf)
             
-            // restore old value
             state^.br_is_main = state.br_stack[state.branch_depth - 1]
-            
-            // here: begin_combine() 
-
             state^.branch_depth = state^.branch_depth - 1;
+
+            for e in state.mutated_vars{
+                array := state.mutation_ledger[e]
+                current_ver := array[state.branch_depth][cast(u8) state.br_is_main] 
+                mainbr := state.mutation_ledger[e][state.branch_depth + 1 ][1]
+                altbr := state.mutation_ledger[e][state.branch_depth + 1 ][0]
+                main_variable: ir_var_t;
+                alt_variable: ir_var_t; 
+                if mainbr>0 {
+                    main_variable = ir_var_t{
+                        name=get_tempname(state.branch_depth+1, e),
+                        ver = mainbr
+                    }
+                }else{
+                    main_variable = ir_var_t{
+                        name=e,
+                        ver=current_ver
+                    }
+                }
+
+                if altbr>0 {
+                    alt_variable = ir_var_t{
+                        name=get_tempname(state.branch_depth+1, e),
+                        ver = altbr
+                    }
+                }else{
+                    alt_variable = ir_var_t{
+                        name=e,
+                        ver=current_ver
+                    }
+                }
+                
+                copy := ir_copy_t{
+                    ir_var_t{e, current_ver+1},
+                    ir_phony_couplet_t{
+                        main_variable, alt_variable
+                    }
+                } 
+
+                array[state.branch_depth][cast(u8) state.br_is_main] = current_ver+1;
+                
+                map_insert(state.mutation_ledger, e, array);
+                state.track_temps[get_tempname(state.branch_depth+1, e) >> 24] += 1;
+                append(ir_buf, copy)
+            }
         }
             
         case empty_stmt_t:
@@ -1660,7 +1704,7 @@ transform_expr :: proc(expr: ^expr_t, state: ^ir_state_t) -> ir_value_t {
             index := cast(u8) state.br_is_main;
             version := ledger[varname][state.branch_depth][index];
             if 0 == version {
-                // this should never happen
+                // this should never fail:
                 assert(state.branch_depth != 0);
 
                 return SUPER(varname, state.branch_depth, state)
@@ -1683,18 +1727,27 @@ transform_expr :: proc(expr: ^expr_t, state: ^ir_state_t) -> ir_value_t {
             varname := state.locals[var_ref]
 
             right := transform_expr(assignment.right, state)
+            index := cast(u8) state.br_is_main
+            version := state.mutation_ledger[varname][state.branch_depth][index]
+            state.mutated_vars[varname] = true;
+            temp := get_tempname(state.branch_depth, varname)
+            if index == 0 && version == 0 {
+                version = state.mutation_ledger[varname][state.branch_depth][1] + 1;
+            }else{
+                version += 1;
+            }
 
-            /*
-            ir_copy(varname, right, state)
-            map_insert(&state.locals, var_ref, varname)
-            dest := latest_valid(state, varname)
-            */ 
-            _ = varname;
-            _ = right;
-            // assign to var
-            panic("unimplemented!")
+            dest := ir_var_t{temp, version};
+            append(ir_buf, ir_copy_t{
+                dest=dest, src=right
+            }
+            );
             
-
+            array := state.mutation_ledger[varname];
+            array[state.branch_depth][index] = version;
+            map_insert(state.mutation_ledger, varname, array);
+            
+            return dest;
         case func_info_t:
             panic("unreachable: functions should not be handled as expressions in ir")
         
@@ -1708,19 +1761,17 @@ emit_label :: proc(label: ir_label_t, ir_buf: ^[dynamic]ir_instruction_t){
     instr := ir_emit_label_t{is=label}
     append(ir_buf, instr)
 }
-/*
-get_new_var :: proc(state: ^ir_state_t)->ir_var_t{
-    new_var := ir_varname_t(state^.var_counter)
-    var := ir_var_t{name=new_var, ver=1 }
-    map_insert(&state.track_versions, var.name, var.ver)
-    state^.var_counter+=1
-    return var
-}
-*/
+
 get_next_varname :: proc(state: ^ir_state_t)->ir_varname_t{
     new_name := ir_varname_t(state.var_counter)
     state^.var_counter+=1
     return new_name
+}
+
+get_tempname :: proc(branch_depth: u32, varname: ir_varname_t) -> ir_varname_t{
+    assert(branch_depth < 256)
+    temp_is :=(branch_depth<< 24) | cast(u32)varname;
+    return cast(ir_varname_t) temp_is
 }
 
 // get_next_globconst :: proc(state: ^ir_state_t)->ir_globconst_t{
@@ -1745,7 +1796,7 @@ import "core:strings"
 format_value :: proc(sbuilder: ^strings.Builder, val: ir_value_t){
     switch type in val{
         case ir_var_t:{           
-            fmt.sbprintf(sbuilder, "tmp%d.%d", val.(ir_var_t).name, val.(ir_var_t).ver)    
+            fmt.sbprintf(sbuilder, "tmp%X.%d", val.(ir_var_t).name, val.(ir_var_t).ver)    
         }
 
         case ir_global_symbol:{
@@ -1756,24 +1807,20 @@ format_value :: proc(sbuilder: ^strings.Builder, val: ir_value_t){
             fmt.sbprintf(sbuilder, "LIT(%d)", val.(int_literal_t))
         }
 
-        case ir_phony_t:
+        case ir_phony_couplet_t: 
             fmt.sbprint(sbuilder, "phony(")
-            phi := val.(ir_phony_t)
-            _ = phi;
-            /* for i in phi.fro..=phi.to{
-                fmt.sbprintf(sbuilder, "tmp%d.%d", phi.src, i)
-                
-                if i != phi.to{
-                    fmt.sbprint(sbuilder, ", ")
-                }
-            }
-            */
-            /*
-            fmt.sbprintf(sbuilder, "tmp%d.%d, ", phi.src, phi.fro)
-            fmt.sbprintf(sbuilder, "tmp%d.%d", phi.src, phi.to)
-            */
+            phi := val.(ir_phony_couplet_t)
+            
+            fmt.sbprintf(sbuilder, "tmp%X.%d, ", phi.first.name, phi.first.ver)
+            fmt.sbprintf(sbuilder, "tmp%X.%d", phi.second.name, phi.second.ver)
+       
             fmt.sbprint(sbuilder, ")")
+        /*
+        case ir_phony_t:
+            
             panic("unimplemented!")
+
+            */
     }
 }
 
