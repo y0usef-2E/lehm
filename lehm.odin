@@ -1476,7 +1476,7 @@ naive_ir :: proc(parser: ^parser_t, list: [dynamic]stmt_t) -> []ir_instruction_t
         locals = new(map[ref_local_t]ir_varname_t)^,
     
         branch_depth=0,
-        br_is_main=false,
+        br_is_main=true,
         mutation_ledger=new(map[ir_varname_t][256]branch_mutation_t),
         mutated_vars=new(map[ir_varname_t]bool)
     }
@@ -1578,8 +1578,8 @@ transform_stmt :: proc(stmt: stmt_t, state: ^ir_state_t) {
             }
             append(ir_buf, jump_combine)
 
+            emit_label(_else, ir_buf)
             if _if.otherwise != nil {
-                emit_label(_else, ir_buf)
                 state.br_is_main = false;
                 transform_stmt(_if.otherwise^, state)
             }
@@ -1590,12 +1590,18 @@ transform_stmt :: proc(stmt: stmt_t, state: ^ir_state_t) {
             state^.branch_depth = state^.branch_depth - 1;
 
             for e in state.mutated_vars{
+                // FIXME(yousef): this is not entirely correct. 
+                // Map should be restored to the correct form after going over all the mutated vars (in this branch-depth).
+
                 array := state.mutation_ledger[e]
                 current_ver := array[state.branch_depth][cast(u8) state.br_is_main] 
                 mainbr := state.mutation_ledger[e][state.branch_depth + 1 ][1]
                 altbr := state.mutation_ledger[e][state.branch_depth + 1 ][0]
                 main_variable: ir_var_t;
                 alt_variable: ir_var_t; 
+
+                dest_name := get_tempname(state.branch_depth, e);
+
                 if mainbr>0 {
                     main_variable = ir_var_t{
                         name=get_tempname(state.branch_depth+1, e),
@@ -1603,7 +1609,7 @@ transform_stmt :: proc(stmt: stmt_t, state: ^ir_state_t) {
                     }
                 }else{
                     main_variable = ir_var_t{
-                        name=e,
+                        name=dest_name,
                         ver=current_ver
                     }
                 }
@@ -1615,19 +1621,22 @@ transform_stmt :: proc(stmt: stmt_t, state: ^ir_state_t) {
                     }
                 }else{
                     alt_variable = ir_var_t{
-                        name=e,
+                        name=dest_name,
                         ver=current_ver
                     }
                 }
                 
+                
                 copy := ir_copy_t{
-                    ir_var_t{e, current_ver+1},
+                    ir_var_t{dest_name, current_ver+1},
                     ir_phony_couplet_t{
                         main_variable, alt_variable
                     }
                 } 
 
                 array[state.branch_depth][cast(u8) state.br_is_main] = current_ver+1;
+                array[state.branch_depth + 1][0]=0;
+                array[state.branch_depth + 1][1]=0;
                 
                 map_insert(state.mutation_ledger, e, array);
                 state.track_temps[get_tempname(state.branch_depth+1, e) >> 24] += 1;
@@ -1648,17 +1657,18 @@ transform_stmt :: proc(stmt: stmt_t, state: ^ir_state_t) {
 }
 
 SUPER :: proc(varname: ir_varname_t, br_depth:u32, state: ^ir_state_t) -> ir_var_t{
-    depth := br_depth - 1; 
+    depth := br_depth - 1;
     for true {
         is_main := state.br_stack[depth];
         index := cast(u8) is_main; 
-        version := state.mutation_ledger[varname][state.branch_depth][index]
+        version := state.mutation_ledger[varname][depth][index]
         // NOTE(yousef): assumes that whenever a branch is terminated, this occurs:
         // ledger[var][br_factor] <- {[0] = 0 , [1] = 0}
         // THIS SHOULD ALWAYS BE TRUE
 
+        fullname := get_tempname(depth, varname) 
         if version != 0{
-            return ir_var_t{name=varname, ver=version}
+            return ir_var_t{name=fullname, ver=version}
         }
         if depth == 0{
             break;
@@ -1666,6 +1676,7 @@ SUPER :: proc(varname: ir_varname_t, br_depth:u32, state: ^ir_state_t) -> ir_var
             depth-=1;
         }
     }
+    
     panic("[FATAL] variable not found in ledger.")
 }
 
