@@ -99,7 +99,7 @@ lexer_t :: struct{
 
 main :: proc(){    
     using binop_t
-
+    fmt.printfln("sizeof(expr_t): %d bytes", size_of(expr_t))
     fmt.printfln("sizeof(parser_t): %d bytes", size_of(parser_t))
     fmt.printfln("sizeof(ir_state_t): %d bytes", size_of(ir_state_t))
 
@@ -108,7 +108,7 @@ main :: proc(){
     test2 := "0b111"
     assert(parse_binary_literal(transmute([]u8)test2) == 7)
 
-    handle, err := os.open("tests/two.lh")
+    handle, err := os.open("tests/three.lh")
     if err != nil{
         fmt.eprintln(err);
         panic("cannot find file"); 
@@ -148,7 +148,7 @@ main :: proc(){
         }
     }
 
-    type_ast(all_stmts[:])
+    type_ast(all_stmts[:], &parser.global_symbols)
 
     ir_buf := naive_ir(&parser, all_stmts)
     
@@ -677,7 +677,9 @@ new_block :: proc() -> block_t{
 }
 
 local_const_t :: struct{
-    ref: ref_local_t
+    ref: ref_local_t,
+
+    constexpr: ^expr_t
 }
 
 ref_local_t :: distinct ^local_t
@@ -686,13 +688,13 @@ local_t :: struct{
     is_var: bool,
     name: identifier_t,
     id: u32,
-    expr: ^expr_t,
-
-    type_rule: type_rule_t
+    type: lehm_type_t
 }
 
 vdecl_stmt_t :: struct{
     is: ref_local_t,
+    init: ^expr_t,
+    type_rule: type_rule_t
 }
 
 return_t :: struct{
@@ -850,15 +852,15 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                         return empty_stmt_t{}
                     }else{
                         ref := push_local(parser, local_t{
-                            is_var=false, name=ident, id=next_var_id(parser), expr=boxed_node(parser, rhs)
+                            is_var=false, name=ident, id=next_var_id(parser), 
                         })
-                        return local_const_t(local_const_t{ref})
+                        return local_const_t(local_const_t{ref, boxed_node(parser, rhs)})
                     }
                     
                     // unreachable: 
                     assert(false)
                 }else {
-                    type_rule: type_rule_t = must_infer_t{inferred=.NOT_READY}
+                    type_rule: type_rule_t = must_infer_t{}
 
                     if consume_identifier(parser, &typename){
                         type_rule = must_reconcile_t{given=typename, inferred=.NOT_READY}
@@ -873,18 +875,24 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                         assert(parser.scope > 0)
 
                         rhs := parse_resolve_expr(parser)
+
+                        if rhs == nil{
+                            panic("Missing initialiser expression in variable declaration.")
+                        }
                         
                         if !consume_token(parser, simple_token_t.SEMI_COLON){
                             panic("malformed var declaration")
                         }
                         
                         at := push_local(parser, local_t{
-                            is_var=true, name=ident, id=next_var_id(parser), expr=boxed_node(parser, rhs),
-                            type_rule=type_rule
+                            is_var=true, name=ident, id=next_var_id(parser), 
+                            
                         })
                         // fmt.eprintln(at)
 
-                        return vdecl_stmt_t{at}
+                        return vdecl_stmt_t{at, boxed_node(parser, rhs), type_rule}
+                    }else if consume_token(parser, .SEMI_COLON){
+                        panic("VarDecl without initialiser unimplemented.")
                     }
                 }
             }
@@ -1389,9 +1397,7 @@ lehm_type_t :: enum{
     NOT_READY=0xFFFF,
 }
 
-must_infer_t :: struct{
-    inferred: lehm_type_t
-}
+must_infer_t :: struct{}
 
 must_reconcile_t :: struct{
     given: identifier_t,
@@ -1403,7 +1409,7 @@ type_rule_t :: union{
     must_reconcile_t,
 }
 
-type_ast :: proc(stmts: []stmt_t){
+type_ast :: proc(stmts: []stmt_t, global_symbols: ^map[identifier_t]lehm_type_t){
     for i in 0..<len(stmts){
         switch t in stmts[i]{
             case empty_stmt_t:
@@ -1411,25 +1417,36 @@ type_ast :: proc(stmts: []stmt_t){
 
             case vdecl_stmt_t:
                 vdecl := &stmts[i].(vdecl_stmt_t)
-                type_expr(cast(^expr_t) &vdecl.is)
-
+                
+                switch t in vdecl.type_rule{
+                    case must_infer_t:
+                        vdecl.is.type = type_expr(vdecl.init, global_symbols)
+                    case must_reconcile_t:
+                        reconcile := &vdecl.type_rule.(must_reconcile_t)
+                        given : ^expr_t = cast(^expr_t) &reconcile.given
+                        ident_ty := type_expr(given, global_symbols)
+                        
+                        init_ty := type_expr(vdecl.init, global_symbols)
+                        check_types(ident_ty, init_ty)
+                        vdecl.is.type = ident_ty
+                }
             case return_t:
                 ret := &stmts[i].(return_t)
-                type_expr(cast(^expr_t) &ret.inner)
+                type_expr(cast(^expr_t) &ret.inner, global_symbols)
 
             case exprstmt_t:
                 exprstmt := &stmts[i].(exprstmt_t)
-                type_expr(cast(^expr_t) &exprstmt.inner)
+                type_expr(cast(^expr_t) &exprstmt.inner, global_symbols)
             
             case if_stmt_t:
                 if_stmt := &stmts[i].(if_stmt_t)
-                type_expr(cast(^expr_t) &if_stmt.cond)
-                type_ast(if_stmt.then.list[:])
-                type_ast(if_stmt.otherwise.list[:])
+                type_expr(cast(^expr_t) &if_stmt.cond, global_symbols)
+                type_ast(if_stmt.then.list[:], global_symbols)
+                type_ast(if_stmt.otherwise.list[:], global_symbols)
 
             case block_t:
                 block := &stmts[i].(block_t)
-                type_ast(block.list[:])
+                type_ast(block.list[:], global_symbols)
 
             case local_const_t:
                 panic("unimplemented")
@@ -1437,19 +1454,40 @@ type_ast :: proc(stmts: []stmt_t){
     }
 }
 
-type_expr :: proc(expr: ^expr_t){
+type_expr :: proc(expr: ^expr_t, global_symbols: ^map[identifier_t]lehm_type_t) -> lehm_type_t {
+
+    type: lehm_type_t = .NONE;
+
     switch t in expr{
         case int_literal_t:
+            type = .INTEGER
+
         case string_literal_t:
+            type = .STRING
         
         case identifier_t:
+            // assumption:
+            // at this state, all indents that haven't already been transformed, 
+            // are global symbols
+            type = global_symbols[expr.(identifier_t)]
+            
         case ref_local_t:
-        case assign_t: 
+
+        case assign_t:
+            assign := expr.(assign_t)
+            ty_left := type_expr(assign.left, global_symbols)
+            ty_right := type_expr(assign.right, global_symbols)
+            check := check_types(ty_left, ty_right)
+            type = check; 
 
         case unexpr_t:
+            inner := expr.(unexpr_t).inner
+            return type_expr(inner, global_symbols)
+
         case binexpr_t:
         
         case struct_info_t:
+
         case func_info_t:
         case proto_t:
         
@@ -1459,6 +1497,19 @@ type_expr :: proc(expr: ^expr_t){
         case if_expr_t, enum_info_t, float_literal_t, char_literal_t:
             panic("unimplemented")
     }
+
+    if type == .NONE{
+        panic("type error")
+    }
+    return type
+}
+
+// very primitive
+check_types :: proc(left: lehm_type_t, right: lehm_type_t) -> lehm_type_t{
+    if left == right {
+        return left;
+    }
+    return .NONE
 }
 
 /*---------------IR---------------*/
@@ -1640,10 +1691,15 @@ transform_stmt :: proc(stmt: stmt_t, state: ^ir_state_t) {
         }
 
         case vdecl_stmt_t:{
-            var := stmt.(vdecl_stmt_t).is
+            vdecl := stmt.(vdecl_stmt_t)
+
+            var := vdecl.is
+            init := vdecl.init
+
             dest_name := get_next_varname(state)
             dest := ir_var_t{dest_name, 1}
-            src := transform_expr(var.expr, state)
+            src := transform_expr(init, state)
+
             append(ir_buf, ir_copy_t{dest=dest, src=src})
             map_insert(&state.locals, var, dest.name)
 
