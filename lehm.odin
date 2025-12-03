@@ -108,7 +108,7 @@ main :: proc(){
     test2 := "0b111"
     assert(parse_binary_literal(transmute([]u8)test2) == 7)
 
-    handle, err := os.open("tests/three.lh")
+    handle, err := os.open("tests/two.lh")
     if err != nil{
         fmt.eprintln(err);
         panic("cannot find file"); 
@@ -123,7 +123,7 @@ main :: proc(){
 
     parser:= parser_t{
         tokens=tokens[:], position=0, nodes=nodes, next_node=0, ptable=[32]u8{},
-        scope=0, global_symbols=make(map[identifier_t]bool), 
+        scope=0, global_symbols=make(map[identifier_t]lehm_type_t), 
         locals_stack=new([4096]^local_t)[:], next_local=0, scope_ptrs=tracker[:], 
         in_proc=false, scope_ident_tracker=map[identifier_t]^scope_t{}, maybe_globals=make([dynamic]identifier_t)
     }
@@ -140,13 +140,15 @@ main :: proc(){
 
     for var in parser.maybe_globals{
         ref := parser.global_symbols[var]
-        if !ref {
+        if ref == .NONE {
             fmt.eprintln("undeclared symbol ", var)
             panic("")
         }else{
             // fmt.eprintln("symbol is ", ref^)
         }
     }
+
+    type_ast(all_stmts[:])
 
     ir_buf := naive_ir(&parser, all_stmts)
     
@@ -533,8 +535,6 @@ scope_t :: struct{
     next: ^scope_t
 }
 
-unit_t :: struct{}
-
 parser_t :: struct {
     tokens: []token_t,
     position: uint,
@@ -544,9 +544,11 @@ parser_t :: struct {
     
     ptable: [32]u8,
 
-    global_symbols: map[identifier_t]bool,
+    global_symbols: map[identifier_t]lehm_type_t,
+
     immutable_int_vars: map[identifier_t]int_literal_t,
     function_pool: map[identifier_t]func_info_t,
+    struct_pool: map[identifier_t]struct_info_t,
 
     scope: u16,
     locals_stack: []^local_t,
@@ -674,22 +676,23 @@ new_block :: proc() -> block_t{
     }
 }
 
-
 local_const_t :: struct{
     ref: ref_local_t
 }
 
-ref_local_t :: ^local_t
+ref_local_t :: distinct ^local_t
 
 local_t :: struct{
     is_var: bool,
     name: identifier_t,
     id: u32,
-    expr: ^expr_t
+    expr: ^expr_t,
+
+    type_rule: type_rule_t
 }
 
 vdecl_stmt_t :: struct{
-    is: ref_local_t
+    is: ref_local_t,
 }
 
 return_t :: struct{
@@ -775,8 +778,8 @@ end_scope :: proc(parser: ^parser_t){
     parser.scope-=1
 }
 
-global_symbol :: proc(parser: ^parser_t, name: identifier_t){
-    map_insert(&parser.global_symbols, name, true)
+global_symbol :: proc(parser: ^parser_t, name: identifier_t, type: lehm_type_t){
+    map_insert(&parser.global_symbols, name, type)
 }
 
 parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
@@ -818,9 +821,11 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
             ident = token
             if peek_token(parser, simple_token_t.COLON, 1){
                 parser.position+=2;
+
                 if consume_token(parser, simple_token_t.COLON){
                     // ConstDecl
-                    // assert value is const
+                    // TODO(yousef): assert value is const
+
                     rhs := parse_resolve_expr(parser)
                     
                     if !consume_token(parser, simple_token_t.SEMI_COLON){
@@ -830,12 +835,14 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                     if parser.scope == 0{
                         #partial switch kind in rhs{
                             case int_literal_t:
-                                global_symbol(parser, ident)
+                                global_symbol(parser, ident, .INTEGER)
                                 map_insert(&parser.immutable_int_vars, ident, rhs.(int_literal_t))
                             case func_info_t:
-                                // FIXME(yousef): allocating for now
-                                global_symbol(parser, ident)
+                                global_symbol(parser, ident, .FUNCTION)
                                 map_insert(&parser.function_pool, ident, rhs.(func_info_t))
+                            case struct_info_t:
+                                global_symbol(parser, ident, .STRUCT_INFO)
+                                map_insert(&parser.struct_pool, ident, rhs.(struct_info_t))
                             case:
                                 panic("unimplemented constant expression")
                         }
@@ -850,30 +857,35 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                     
                     // unreachable: 
                     assert(false)
-                }
-                
-                if consume_identifier(parser, &typename){}
-                
-                if consume_token(parser, simple_token_t.EQ){
-                    // VarDecl
+                }else {
+                    type_rule: type_rule_t = must_infer_t{inferred=.NOT_READY}
 
-                    if !parser.in_proc {
-                        panic("variable declarations disallowed outside procedures")
+                    if consume_identifier(parser, &typename){
+                        type_rule = must_reconcile_t{given=typename, inferred=.NOT_READY}
                     }
-                    assert(parser.scope > 0)
 
-                    rhs := parse_resolve_expr(parser)
-                    
-                    if !consume_token(parser, simple_token_t.SEMI_COLON){
-                        panic("malformed var declaration")
+                    if consume_token(parser, simple_token_t.EQ){
+                        // VarDecl
+
+                        if !parser.in_proc {
+                            panic("variable declarations disallowed outside procedures")
+                        }
+                        assert(parser.scope > 0)
+
+                        rhs := parse_resolve_expr(parser)
+                        
+                        if !consume_token(parser, simple_token_t.SEMI_COLON){
+                            panic("malformed var declaration")
+                        }
+                        
+                        at := push_local(parser, local_t{
+                            is_var=true, name=ident, id=next_var_id(parser), expr=boxed_node(parser, rhs),
+                            type_rule=type_rule
+                        })
+                        // fmt.eprintln(at)
+
+                        return vdecl_stmt_t{at}
                     }
-                    
-                    at := push_local(parser, local_t{
-                        is_var=true, name=ident, id=next_var_id(parser), expr=boxed_node(parser, rhs)
-                    })
-                    // fmt.eprintln(at)
-
-                    return vdecl_stmt_t{at}
                 }
             }
         }
@@ -995,7 +1007,7 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
                             
                             if local.name == ident{
                                 // fmt.println("resolving: ", ident)
-                                neu: expr_t = parser.locals_stack[j]
+                                neu: expr_t = cast(ref_local_t) parser.locals_stack[j]
                                 // fmt.println("is: ", expr)
 
                                 return neu
@@ -1357,6 +1369,96 @@ parse_prim :: proc(parser: ^parser_t) -> expr_t{
     }
 
     return nil
+}
+
+/*---------------Typing---------------*/
+lehm_type_t :: enum{
+    NONE=0,
+
+    INTEGER,
+    STRING, 
+    
+    FUNCTION, 
+
+    STRUCT_INFO,
+    STRUCT_INSTANCE,
+
+    ARRAY,
+    MAP, 
+
+    NOT_READY=0xFFFF,
+}
+
+must_infer_t :: struct{
+    inferred: lehm_type_t
+}
+
+must_reconcile_t :: struct{
+    given: identifier_t,
+    inferred: lehm_type_t
+}
+
+type_rule_t :: union{
+    must_infer_t,
+    must_reconcile_t,
+}
+
+type_ast :: proc(stmts: []stmt_t){
+    for i in 0..<len(stmts){
+        switch t in stmts[i]{
+            case empty_stmt_t:
+                continue;
+
+            case vdecl_stmt_t:
+                vdecl := &stmts[i].(vdecl_stmt_t)
+                type_expr(cast(^expr_t) &vdecl.is)
+
+            case return_t:
+                ret := &stmts[i].(return_t)
+                type_expr(cast(^expr_t) &ret.inner)
+
+            case exprstmt_t:
+                exprstmt := &stmts[i].(exprstmt_t)
+                type_expr(cast(^expr_t) &exprstmt.inner)
+            
+            case if_stmt_t:
+                if_stmt := &stmts[i].(if_stmt_t)
+                type_expr(cast(^expr_t) &if_stmt.cond)
+                type_ast(if_stmt.then.list[:])
+                type_ast(if_stmt.otherwise.list[:])
+
+            case block_t:
+                block := &stmts[i].(block_t)
+                type_ast(block.list[:])
+
+            case local_const_t:
+                panic("unimplemented")
+        }
+    }
+}
+
+type_expr :: proc(expr: ^expr_t){
+    switch t in expr{
+        case int_literal_t:
+        case string_literal_t:
+        
+        case identifier_t:
+        case ref_local_t:
+        case assign_t: 
+
+        case unexpr_t:
+        case binexpr_t:
+        
+        case struct_info_t:
+        case func_info_t:
+        case proto_t:
+        
+        case func_call_t:
+            panic("unimplemented")
+        
+        case if_expr_t, enum_info_t, float_literal_t, char_literal_t:
+            panic("unimplemented")
+    }
 }
 
 /*---------------IR---------------*/

@@ -3,7 +3,6 @@
 - try to handle SIGNED/UNSIGNED differently;
 - compile-time hashmap;
 - const is ::, var is ':=';
-- later, consider immutable vars;
 - structs, enums, descriminated unions, and proper pattern matching;
 - no class-based inheritance;
 - C-like types (vanilla unions, cstrings, ...); 
