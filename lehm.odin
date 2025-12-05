@@ -138,6 +138,12 @@ main :: proc(){
     for stmt := parse_stmt(&parser); stmt!=nil ; stmt=parse_stmt(&parser){
         append(&all_stmts, stmt)
     }
+    
+    builtin_types :: []string{"usize", "u32", "u8", "string"}
+    for type in builtin_types{
+        map_insert(&parser.global_symbols, identifier_t(type), lehm_type_t.TYPENAME)
+    }
+
 
     for var in parser.maybe_globals{
         ref := parser.global_symbols[var]
@@ -149,22 +155,18 @@ main :: proc(){
         }
     }
 
-    builtin_types :: []string{"usize", "u32", "u8", "string"}
-    for type in builtin_types{
-        map_insert(&parser.global_symbols, identifier_t(type), lehm_type_t.TYPENAME)
-    }
-
     bin_table := init_bin_table()
-    
-    fmt.eprintln("type functions:")
+
     for _, func_info in parser.function_pool{
-        type_ast(func_info.body.list[:], &parser.global_symbols, bin_table)
+        type_ast(func_info.body.list[:], &parser, bin_table)
     }
 
+    /*
     fmt.eprintln("after typing: ")
     for _, func_info in parser.function_pool{
         fmt.eprintln(func_info)
     }
+    */
     
     ir_buf := naive_ir(&parser, all_stmts)
     
@@ -566,6 +568,7 @@ parser_t :: struct {
     global_int_constants: map[identifier_t]int_literal_t,    
     function_pool: map[identifier_t]func_info_t,
     struct_pool: map[identifier_t]struct_info_t,
+    alias_pool: map[identifier_t]identifier_t,
 
     scope: u16,
     locals_stack: []^local_t,
@@ -716,7 +719,8 @@ local_t :: struct{
 vdecl_stmt_t :: struct{
     is: ref_local_t,
     init: ^expr_t,
-    type_rule: type_rule_t
+    type_rule: type_rule_t,
+    typename: ^expr_t
 }
 
 return_t :: struct{
@@ -867,7 +871,13 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                             case struct_info_t:
                                 global_symbol(parser, ident, .STRUCT_INFO)
                                 map_insert(&parser.struct_pool, ident, rhs.(struct_info_t))
+
+                            case identifier_t: 
+                                global_symbol(parser, ident, .ALIAS)
+                                map_insert(&parser.alias_pool, ident, rhs.(identifier_t))
+                                
                             case:
+                                fmt.eprintln("AT: ", rhs)
                                 panic("unimplemented constant expression")
                         }
                         
@@ -882,10 +892,10 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                     // unreachable: 
                     assert(false)
                 }else {
-                    type_rule: type_rule_t = must_infer_t{}
+                    type_rule: type_rule_t = .MUST_INFER;
 
                     if consume_identifier(parser, &typename){
-                        type_rule = must_reconcile_t{given=typename, inferred=.NONE}
+                        type_rule = .MUST_RECONCILE
                     }
 
                     if consume_token(parser, simple_token_t.EQ){
@@ -912,7 +922,7 @@ parse_stmt :: proc(parser: ^parser_t) -> stmt_t {
                         })
                         // fmt.eprintln(at)
 
-                        return vdecl_stmt_t{at, boxed_node(parser, rhs), type_rule}
+                        return vdecl_stmt_t{at, boxed_node(parser, rhs), type_rule, boxed_node(parser, typename)}
                     }else if consume_token(parser, .SEMI_COLON){
                         panic("VarDecl without initialiser unimplemented.")
                     }
@@ -1419,21 +1429,18 @@ lehm_type_t :: enum{
     MAP,
     
     TYPENAME,
+
+    ALIAS,
 }
 
 must_infer_t :: struct{}
 
-must_reconcile_t :: struct{
-    given: identifier_t,
-    inferred: lehm_type_t
+type_rule_t :: enum{
+    MUST_RECONCILE, 
+    MUST_INFER
 }
 
-type_rule_t :: union{
-    must_infer_t,
-    must_reconcile_t,
-}
-
-type_ast :: proc(stmts: []stmt_t, global_symbols: ^map[identifier_t]lehm_type_t, bin_table: map[type_couplet_t] [0xFF]lehm_type_t){
+type_ast :: proc(stmts: []stmt_t, parser: ^parser_t, bin_table: map[type_couplet_t] [0xFF]lehm_type_t){
     for i in 0..<len(stmts){
         switch t in stmts[i]{
             case empty_stmt_t:
@@ -1442,38 +1449,37 @@ type_ast :: proc(stmts: []stmt_t, global_symbols: ^map[identifier_t]lehm_type_t,
             case vdecl_stmt_t:
                 vdecl := &stmts[i].(vdecl_stmt_t)
                 
-                switch t in vdecl.type_rule{
-                    case must_infer_t:
+                switch vdecl.type_rule{
+                    case .MUST_INFER:
                         fmt.eprintln("typing: ", vdecl.is)
-                        ty := type_expr(vdecl.init, global_symbols, bin_table)
+                        ty := type_expr(vdecl.init, parser, bin_table)
                         fmt.eprintln("type is: ", ty)
                         vdecl.is^.type = ty 
-                    case must_reconcile_t:
-                        reconcile := &vdecl.type_rule.(must_reconcile_t)
-                        given : ^expr_t = cast(^expr_t) &reconcile.given
-                        ident_ty := type_expr(given, global_symbols, bin_table)
+                    case .MUST_RECONCILE:
+                        given :=  vdecl.typename
+                        ident_ty := type_expr(given, parser, bin_table)
                         
-                        init_ty := type_expr(vdecl.init, global_symbols, bin_table)
+                        init_ty := type_expr(vdecl.init, parser, bin_table)
                         check_assignment(ident_ty, init_ty)
                         vdecl.is.type = ident_ty
                 }
             case return_t:
                 ret := &stmts[i].(return_t)
-                type_expr(ret.inner, global_symbols, bin_table)
+                type_expr(ret.inner, parser, bin_table)
 
             case exprstmt_t:
                 exprstmt := &stmts[i].(exprstmt_t)
-                type_expr(exprstmt.inner, global_symbols, bin_table)
+                type_expr(exprstmt.inner, parser, bin_table)
             
             case if_stmt_t:
                 if_stmt := &stmts[i].(if_stmt_t)
-                type_expr(if_stmt.cond, global_symbols, bin_table)
-                type_ast(if_stmt.then.list[:], global_symbols, bin_table)
-                type_ast(if_stmt.otherwise.list[:], global_symbols, bin_table)
+                type_expr(if_stmt.cond, parser, bin_table)
+                type_ast(if_stmt.then.list[:], parser, bin_table)
+                type_ast(if_stmt.otherwise.list[:], parser, bin_table)
 
             case block_t:
                 block := &stmts[i].(block_t)
-                type_ast(block.list[:], global_symbols, bin_table)
+                type_ast(block.list[:], parser, bin_table)
 
             case local_const_t:
                 panic("unimplemented")
@@ -1481,8 +1487,10 @@ type_ast :: proc(stmts: []stmt_t, global_symbols: ^map[identifier_t]lehm_type_t,
     }
 }
 
-type_expr :: proc(expr: ^expr_t, global_symbols: ^map[identifier_t]lehm_type_t, bin_table: map[type_couplet_t] [0xFF]lehm_type_t) -> lehm_type_t {
+type_expr :: proc(expr: ^expr_t, parser: ^parser_t, bin_table: map[type_couplet_t] [0xFF]lehm_type_t) -> lehm_type_t {
     type: lehm_type_t = .NONE;
+
+    global_symbols := &parser.global_symbols; 
     
     switch t in expr{
         case int_literal_t:
@@ -1490,12 +1498,25 @@ type_expr :: proc(expr: ^expr_t, global_symbols: ^map[identifier_t]lehm_type_t, 
 
         case string_literal_t:
             type = .STRING
-        
+
         case identifier_t:
             // assumption:
             // at this state, all indents that haven't already been transformed, 
             // are global symbols
-            type = global_symbols[expr.(identifier_t)]
+
+            ident :=  expr.(identifier_t)
+            _, kind, _, _ := map_entry(global_symbols, ident);
+            
+            refers_to: ^identifier_t;
+
+            for kind^ == .ALIAS{
+                _, refers_to, _, _ = map_entry(&parser.alias_pool, ident)
+
+                _, kind, _, _ = map_entry(global_symbols, refers_to^)
+            }
+            fmt.eprintln("started with: ", ident, "got: ", kind^);
+            
+            type = kind^
             
         case ref_local_t:
             ref := (cast(^local_t) expr.(ref_local_t)) 
@@ -1503,18 +1524,18 @@ type_expr :: proc(expr: ^expr_t, global_symbols: ^map[identifier_t]lehm_type_t, 
 
         case assign_t:
             assign := expr.(assign_t)
-            ty_left := type_expr(assign.left, global_symbols, bin_table)
-            ty_right := type_expr(assign.right, global_symbols, bin_table)
+            ty_left := type_expr(assign.left, parser, bin_table)
+            ty_right := type_expr(assign.right, parser, bin_table)
             type = check_assignment(ty_left, ty_right); 
 
         case unexpr_t:
             inner := expr.(unexpr_t).inner
-            type = type_expr(inner, global_symbols, bin_table)
+            type = type_expr(inner, parser, bin_table)
 
         case binexpr_t:
             binexpr := expr.(binexpr_t)
-            ty_left := type_expr(binexpr.left, global_symbols, bin_table)
-            ty_right := type_expr(binexpr.right, global_symbols, bin_table)
+            ty_left := type_expr(binexpr.left, parser, bin_table)
+            ty_right := type_expr(binexpr.right, parser, bin_table)
             type = check_binary(ty_left, ty_right, binexpr.op, bin_table)
 
         case struct_info_t:
@@ -1565,7 +1586,6 @@ binop_t :: enum u8{
 }
 */
 init_bin_table :: proc() -> map[type_couplet_t] [0xFF]lehm_type_t {
-    // FIXME(yousef): this array should be put somewhere else (updating it here only would break the logic in other parts)
     using binop_t;
     USIZE_USIZE :: type_couplet_t{"usize", "usize"}
     USIZE_U8 :: type_couplet_t{"usize", "u8"}
