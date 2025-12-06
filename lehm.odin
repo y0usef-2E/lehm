@@ -126,7 +126,7 @@ main :: proc(){
         tokens=tokens[:], position=0, nodes=nodes, next_node=0, ptable=[32]u8{},
         scope=0, global_symbols=make(map[identifier_t]lehm_type_t), 
         locals_stack=new([4096]^local_t)[:], next_local=0, scope_ptrs=tracker[:], 
-        in_proc=false, scope_ident_tracker=map[identifier_t]^scope_t{}, maybe_globals=make([dynamic]identifier_t)
+        in_proc=false, scope_ident_tracker=map[identifier_t]^scope_t{}, maybe_globals=make([dynamic]identifier_t),
     }
 
     init_precedence(&parser) 
@@ -138,12 +138,18 @@ main :: proc(){
     for stmt := parse_stmt(&parser); stmt!=nil ; stmt=parse_stmt(&parser){
         append(&all_stmts, stmt)
     }
-    
-    builtin_types :: []string{"usize", "u32", "u8", "string"}
+
+    builtin_types :: []string{"usize", "bool", "u8", "string"}
     for type in builtin_types{
         map_insert(&parser.global_symbols, identifier_t(type), lehm_type_t.TYPENAME)
     }
 
+    parser.unique_typenames = map[identifier_t]lehm_type_t{
+        "usize" = .USIZE,
+        "bool" = .BOOL, 
+        "u8"= .U8,
+        "string"=.STRING, 
+    }
 
     for var in parser.maybe_globals{
         ref := parser.global_symbols[var]
@@ -569,6 +575,7 @@ parser_t :: struct {
     function_pool: map[identifier_t]func_info_t,
     struct_pool: map[identifier_t]struct_info_t,
     alias_pool: map[identifier_t]identifier_t,
+    unique_typenames: map[identifier_t]lehm_type_t,
 
     scope: u16,
     locals_stack: []^local_t,
@@ -1451,9 +1458,7 @@ type_ast :: proc(stmts: []stmt_t, parser: ^parser_t, bin_table: map[type_couplet
                 
                 switch vdecl.type_rule{
                     case .MUST_INFER:
-                        fmt.eprintln("typing: ", vdecl.is)
                         ty := type_expr(vdecl.init, parser, bin_table)
-                        fmt.eprintln("type is: ", ty)
                         vdecl.is^.type = ty 
                     case .MUST_RECONCILE:
                         given :=  vdecl.typename
@@ -1487,6 +1492,21 @@ type_ast :: proc(stmts: []stmt_t, parser: ^parser_t, bin_table: map[type_couplet
     }
 }
 
+/*
+sanity check: 
+    /*
+    
+    T :: string; 
+    k :: T; 
+
+    main :: fn() {
+        j: k = "tiny"; 
+        j = 10;
+    };
+
+    */
+*/
+
 type_expr :: proc(expr: ^expr_t, parser: ^parser_t, bin_table: map[type_couplet_t] [0xFF]lehm_type_t) -> lehm_type_t {
     type: lehm_type_t = .NONE;
 
@@ -1507,16 +1527,36 @@ type_expr :: proc(expr: ^expr_t, parser: ^parser_t, bin_table: map[type_couplet_
             ident :=  expr.(identifier_t)
             _, kind, _, _ := map_entry(global_symbols, ident);
             
-            refers_to: ^identifier_t;
-
-            for kind^ == .ALIAS{
-                _, refers_to, _, _ = map_entry(&parser.alias_pool, ident)
-
-                _, kind, _, _ = map_entry(global_symbols, refers_to^)
-            }
-            fmt.eprintln("started with: ", ident, "got: ", kind^);
             
-            type = kind^
+            #partial switch kind^ {
+                case .TYPENAME: {
+                    _, lehmtype, _, _ := map_entry(&parser.unique_typenames, ident)
+                    type = lehmtype^
+                }
+                
+                case .ALIAS: {
+                    refers_to: ^identifier_t = &ident;
+
+                    for kind^ == .ALIAS{
+                        _, refers_to, _, _ = map_entry(&parser.alias_pool, refers_to^)
+
+                        _, kind, _, _ = map_entry(global_symbols, refers_to^)
+                    }
+
+                    _, lehmtype, _, _ := map_entry(&parser.unique_typenames, refers_to^)
+                    if lehmtype == nil {
+                        // assumption:
+                        // unless there is a bug this should be caught at an earlier stage (name resolution)
+                        // i.e. if everything is correct, this codeapth should be unreachable.
+                        fmt.eprintfln("type {} aliases nonexisting type {}", ident, refers_to)
+                        panic("")
+                    }
+                    fmt.eprintfln("type {} is {} ", ident, lehmtype^)
+                    type = lehmtype^
+                }
+                case: 
+                    panic("unreachable")
+            }
             
         case ref_local_t:
             ref := (cast(^local_t) expr.(ref_local_t)) 
@@ -1568,7 +1608,8 @@ check_assignment :: proc(assign_to: lehm_type_t, rhs: lehm_type_t) -> lehm_type_
     if assign_to == rhs {
         return assign_to;
     }
-    return .NONE
+    fmt.eprintfln("type error: cannot assign expr of type {} to variable of type {}", rhs, assign_to)
+    panic("")
 }
 
 type_couplet_t :: struct{
