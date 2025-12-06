@@ -53,7 +53,15 @@ Logical-Expr = Binary-Expr Connective Logical-Expr | Binary-Expr
 
 Binary-Expr = Unary-Expr Arithmetic-Op Binary-Expr | Unary-Expr
 
-Unary-Expr = Unary-Op Unary-Expr | Primary-Expr
+Unary-Expr = Unary-Op Unary-Expr | Postfix-Expr 
+
+Postfix-Expr = Primary-Expr Postfix-Op | Primarx-Expr
+
+Postfix-Op = Indexer | Struct-Accessor
+
+Indexer = "[" Expr "]" 
+
+Struct-Accessor = "." Identifier
 
 Primary-Expr = "(" Expr ")" | Literal-Token | Identifier
 

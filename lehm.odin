@@ -646,7 +646,26 @@ expr_t :: union {
     proto_t,
     enum_info_t,
     ref_local_t,
-    func_call_t
+    func_call_t,
+    postfix_expr_t
+}
+
+postfix_expr_t :: struct{
+    expr: ^expr_t,
+    op: postop_t
+}
+
+postop_t :: union {
+    array_indexer_t, 
+    struct_accessor_t
+}
+
+array_indexer_t :: struct{
+    at: ^expr_t
+}
+
+struct_accessor_t :: struct{
+    key: ^expr_t
 }
 
 assign_t :: struct{
@@ -660,7 +679,8 @@ struct_info_t :: struct{
 }
 
 struct_instance_t :: struct{
-
+    of: struct_info_t,
+    data: map[identifier_t]expr_t
 }
 
 proto_t :: struct{
@@ -1105,6 +1125,10 @@ parse_resolve_expr :: proc(parser: ^parser_t) -> expr_t{
             case ref_local_t:
                 return expr
 
+            case postfix_expr_t: 
+                fmt.eprintfln("unimplemented postfix expr: {}", expr)
+                panic("")
+
             case struct_instance_t, struct_info_t, enum_info_t, proto_t:
                 fmt.eprintln("[warning] name resolution not implemented for this variant")
                 panic("unimplemented")
@@ -1256,10 +1280,41 @@ parse_unexpr :: proc(parser: ^parser_t) -> expr_t{
             op=unop, inner=boxed_node(parser, inner)
         }
     }else{
-        inner := parse_prim(parser)
+        inner := parse_postfix_expr(parser)
         return inner
     }
     
+}
+
+parse_postfix_expr :: proc(parser: ^parser_t) -> expr_t{
+    primary := parse_prim(parser)
+
+    if consume_token(parser, .LEFT_BRACKET){
+        indexer_expr := parse_resolve_expr(parser)
+        if consume_token(parser, .RIGHT_BRACKET){
+            return postfix_expr_t{
+                boxed_node(parser, primary), array_indexer_t {
+                    at=boxed_node(parser, indexer_expr)
+                }
+            }
+        }else{
+            panic("Syntax Error: missing closing brack in indexer expression")
+        }
+    } else if consume_token(parser, .DOT){
+        ident: identifier_t; 
+        if consume_identifier(parser, &ident){
+            return postfix_expr_t{
+                boxed_node(parser, primary), struct_accessor_t {
+                    key=boxed_node(parser, ident)
+                }
+            }
+        }else{
+            fmt.eprintfln("Syntax Error: expected identifier after '.'; found {}", parser.tokens[parser.position])
+            panic("")
+        }
+    }else{
+        return primary
+    }
 }
 
 parse_prim :: proc(parser: ^parser_t) -> expr_t{
@@ -1578,6 +1633,9 @@ type_expr :: proc(expr: ^expr_t, parser: ^parser_t, bin_table: map[type_couplet_
             ty_right := type_expr(binexpr.right, parser, bin_table)
             type = check_binary(ty_left, ty_right, binexpr.op, bin_table)
 
+        case postfix_expr_t:
+            panic("unimplemented")
+            
         case struct_info_t:
             panic("unimplemented")
         case struct_instance_t:
@@ -2025,6 +2083,8 @@ SUPER :: proc(varname: ir_varname_t, br_depth:u32, state: ^ir_state_t) -> ir_var
         // NOTE(yousef): assumes that whenever a branch is terminated, this occurs:
         // ledger[var][br_factor] <- {[0] = 0 , [1] = 0}
         // THIS SHOULD ALWAYS BE TRUE
+
+        // NOTE(yousef): is the above assumption/condition correct, tho?
 
         fullname := get_tempname(depth, varname) 
         if version != 0{
